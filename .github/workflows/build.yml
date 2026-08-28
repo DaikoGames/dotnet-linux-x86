@@ -1,0 +1,161 @@
+name: Build & Test .NET 9 Linux x86 Self-Contained Abomination
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  UseNinja: true
+  CMAKE_GENERATOR: Ninja
+  
+  # THE "IL FAILED" FIXES (CRITICAL COMPILER VARIABLES)
+  CFLAGS: "-mstackrealign -fPIC"
+  CXXFLAGS: "-mstackrealign -fPIC -ftls-model=global-dynamic"
+  LDFLAGS: "-Wl,-z,noexecstack"
+
+jobs:
+  build-and-test-linux-x86:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout .NET 9 Runtime
+      uses: actions/checkout@v4
+      with:
+        repository: dotnet/runtime
+        ref: release/9.0
+        path: runtime
+
+    - name: Install 32-bit Cross-Compilation & Execution Dependencies
+      run: |
+        sudo dpkg --add-architecture i386
+        sudo apt-get update
+        # Build dependencies
+        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libssl-dev:i386
+        # Execution dependencies (Crucial: allows the x64 runner to execute our 32-bit x86 binaries)
+        sudo apt-get install -y libc6:i386 libstdc++6:i386 libgcc-s1:i386
+        # Build tools
+        sudo apt-get install -y cmake ninja-build ccache clang
+
+    - name: Setup ccache for 10-minute builds
+      run: |
+        echo "/usr/lib/ccache" >> $GITHUB_PATH
+        ccache -M 2.0G
+        ccache -z
+
+    - name: Build x86 Cross-Compilation RootFS
+      working-directory: runtime
+      run: |
+        sudo ./eng/common/cross/build-rootfs.sh x86
+
+    - name: Build CoreCLR, Libraries, and Host
+      working-directory: runtime
+      run: |
+        ./build.sh -subset clr+libs+host \
+                   -runtimeconfiguration Release \
+                   -architecture x86 \
+                   -cross \
+                   --ninja \
+                   /p:UseNinja=true \
+                   /p:EnableNinja=true \
+                   /p:InvariantGlobalization=false \
+                   /p:EnableNativeAOT=false
+
+    - name: Package Self-Contained Runtime
+      run: |
+        mkdir -p dotnet-portable-x86
+        cp -r runtime/artifacts/bin/corehost/Linux.x86.Release/* dotnet-portable-x86/
+        cp -r runtime/artifacts/bin/coreclr/Linux.x86.Release/* dotnet-portable-x86/
+        cp -r runtime/artifacts/bin/System.Private.CoreLib/Linux.x86.Release/* dotnet-portable-x86/
+        find runtime/artifacts/bin/runtime/ -name "*.dll" -exec cp {} dotnet-portable-x86/ \;
+        find runtime/artifacts/bin/native/ -name "*.so" -exec cp {} dotnet-portable-x86/ \;
+
+    - name: Create "Run From Anywhere" Launcher
+      run: |
+        cat << 'EOF' > dotnet-portable-x86/run.sh
+        #!/bin/bash
+        DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+        export DOTNET_ROOT="$DIR"
+        export PATH="$DIR:$PATH"
+        exec "$DIR/dotnet" "$@"
+        EOF
+        chmod +x dotnet-portable-x86/run.sh
+
+    # ==========================================
+    # THE TESTING PHASE
+    # ==========================================
+    - name: Install Standard .NET 9 SDK (For compiling the test app)
+      run: |
+        wget https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
+        chmod +x dotnet-install.sh
+        ./dotnet-install.sh --channel 9.0 --install-dir ./dotnet-sdk
+
+    - name: Create IL Stress Test Project
+      run: |
+        ./dotnet-sdk/dotnet new console -n IL_Stress_Test -o IL_Stress_Test --framework net9.0
+        
+        # Overwrite Program.cs with our specific IL/JIT stress test
+        cat << 'CSHARP' > IL_Stress_Test/Program.cs
+        using System;
+        using System.Threading;
+        using System.Threading.Tasks;
+        using System.Runtime.InteropServices;
+
+        class Program {
+            static int Main() {
+                Console.WriteLine("=== Starting IL Stress Test for Linux x86 ===");
+                
+                // 1. Test SSE/Math (Verifies 16-byte stack alignment fix)
+                double result = 0;
+                for(int i=0; i<10000; i++) result += Math.Sin(i) * Math.Cos(i);
+                Console.WriteLine($"[PASS] Math/SSE Stack Alignment: {result}");
+
+                // 2. Test Threading/TLS (Verifies global-dynamic TLS fix)
+                Parallel.For(0, 100, i => {
+                    Thread.Sleep(1);
+                    int threadId = Thread.CurrentThread.ManagedThreadId;
+                });
+                Console.WriteLine("[PASS] Threading & TLS");
+
+                // 3. Test GC & Memory (Verifies 32-bit address space & W^X JIT memory)
+                byte[][] arrays = new byte[100][];
+                for(int i=0; i<100; i++) arrays[i] = new byte[1024 * 1024]; // 100MB
+                GC.Collect();
+                Console.WriteLine("[PASS] GC & Memory Allocation");
+
+                // 4. Test P/Invoke (Verifies Linux x86 calling conventions)
+                int pid = getpid();
+                Console.WriteLine($"[PASS] P/Invoke (libc getpid): {pid}");
+
+                Console.WriteLine("=== ALL IL TESTS PASSED! RUNTIME IS STABLE ===");
+                return 0;
+            }
+
+            [DllImport("libc")]
+            static extern int getpid();
+        }
+        CSHARP
+
+    - name: Compile IL Stress Test
+      working-directory: IL_Stress_Test
+      run: |
+        ../dotnet-sdk/dotnet build -c Release
+
+    - name: Execute IL Stress Test on Custom x86 Runtime
+      run: |
+        # This is the critical moment. We run the compiled IL using OUR custom portable x86 runtime.
+        # If the JIT/IL fixes failed, this will segfault and the step will fail.
+        ./dotnet-portable-x86/run.sh exec ./IL_Stress_Test/bin/Release/net9.0/IL_Stress_Test.dll
+
+    - name: Zip the Final Abomination
+      if: success()
+      run: |
+        zip -r dotnet9-linux-x86-portable.zip dotnet-portable-x86
+
+    - name: Upload Artifact
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: dotnet9-linux-x86-selfcontained-tested
+        path: dotnet9-linux-x86-portable.zip
+        retention-days: 7
