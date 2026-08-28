@@ -31,7 +31,7 @@ jobs:
         sudo dpkg --add-architecture i386
         sudo apt-get update
         
-        # 1. Build dependencies + debootstrap (FIXES THE "command not found" ERROR)
+        # 1. Build dependencies + debootstrap
         sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libssl-dev:i386 debootstrap qemu-user-static binutils
         
         # 2. Execution dependencies (Allows the x64 runner to execute our 32-bit x86 binaries later)
@@ -49,11 +49,14 @@ jobs:
     - name: Build x86 Cross-Compilation RootFS
       working-directory: runtime
       run: |
-        # This will now successfully find 'debootstrap' and create the 32-bit environment
+        # This creates the 32-bit environment in .tools/rootfs/x86
         sudo ./eng/common/cross/build-rootfs.sh x86
 
     - name: Build CoreCLR, Libraries, and Host
       working-directory: runtime
+      env:
+        # CRITICAL FIX: Explicitly tell the build script WHERE the rootfs is located
+        ROOTFS_DIR: ${{ github.workspace }}/runtime/.tools/rootfs/x86
       run: |
         ./build.sh -subset clr+libs+host \
                    -runtimeconfiguration Release \
