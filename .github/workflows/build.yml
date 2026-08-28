@@ -26,15 +26,18 @@ jobs:
         ref: release/9.0
         path: runtime
 
-    - name: Install 32-bit Cross-Compilation & Execution Dependencies
+    - name: Install Cross-Compilation & Execution Dependencies
       run: |
         sudo dpkg --add-architecture i386
         sudo apt-get update
-        # Build dependencies
-        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libssl-dev:i386
-        # Execution dependencies (Crucial: allows the x64 runner to execute our 32-bit x86 binaries)
+        
+        # 1. Build dependencies + debootstrap (FIXES THE "command not found" ERROR)
+        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libssl-dev:i386 debootstrap qemu-user-static binutils
+        
+        # 2. Execution dependencies (Allows the x64 runner to execute our 32-bit x86 binaries later)
         sudo apt-get install -y libc6:i386 libstdc++6:i386 libgcc-s1:i386
-        # Build tools
+        
+        # 3. Build tools
         sudo apt-get install -y cmake ninja-build ccache clang
 
     - name: Setup ccache for 10-minute builds
@@ -46,6 +49,7 @@ jobs:
     - name: Build x86 Cross-Compilation RootFS
       working-directory: runtime
       run: |
+        # This will now successfully find 'debootstrap' and create the 32-bit environment
         sudo ./eng/common/cross/build-rootfs.sh x86
 
     - name: Build CoreCLR, Libraries, and Host
@@ -94,7 +98,6 @@ jobs:
       run: |
         ./dotnet-sdk/dotnet new console -n IL_Stress_Test -o IL_Stress_Test --framework net9.0
         
-        # Overwrite Program.cs with our specific IL/JIT stress test
         cat << 'CSHARP' > IL_Stress_Test/Program.cs
         using System;
         using System.Threading;
@@ -144,7 +147,6 @@ jobs:
     - name: Execute IL Stress Test on Custom x86 Runtime
       run: |
         # This is the critical moment. We run the compiled IL using OUR custom portable x86 runtime.
-        # If the JIT/IL fixes failed, this will segfault and the step will fail.
         ./dotnet-portable-x86/run.sh exec ./IL_Stress_Test/bin/Release/net9.0/IL_Stress_Test.dll
 
     - name: Zip the Final Abomination
