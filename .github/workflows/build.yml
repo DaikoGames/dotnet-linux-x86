@@ -58,23 +58,29 @@ jobs:
         # CRITICAL FIX: Explicitly tell the build script WHERE the rootfs is located
         ROOTFS_DIR: ${{ github.workspace }}/runtime/.tools/rootfs/x86
       run: |
-        ./build.sh -subset clr+libs+host \
-                   -runtimeconfiguration Release \
-                   -architecture x86 \
+        # FIXED: Changed '-architecture x86' to '-arch x86' (the correct Arcade build switch)
+        # Also simplified configuration flags to match .NET 9 build.sh expectations
+        ./build.sh -arch x86 \
+                   -c Release \
+                   -subset clr+libs+host \
                    -cross \
                    --ninja \
                    /p:UseNinja=true \
-                   /p:EnableNinja=true \
                    /p:InvariantGlobalization=false \
                    /p:EnableNativeAOT=false
 
     - name: Package Self-Contained Runtime
       run: |
         mkdir -p dotnet-portable-x86
+        # Copy the custom built coreclr, libs, and host
         cp -r runtime/artifacts/bin/corehost/Linux.x86.Release/* dotnet-portable-x86/
         cp -r runtime/artifacts/bin/coreclr/Linux.x86.Release/* dotnet-portable-x86/
         cp -r runtime/artifacts/bin/System.Private.CoreLib/Linux.x86.Release/* dotnet-portable-x86/
+        
+        # Copy all the managed BCL DLLs
         find runtime/artifacts/bin/runtime/ -name "*.dll" -exec cp {} dotnet-portable-x86/ \;
+        
+        # Copy native dependencies (libSystem.Native, etc.)
         find runtime/artifacts/bin/native/ -name "*.so" -exec cp {} dotnet-portable-x86/ \;
 
     - name: Create "Run From Anywhere" Launcher
