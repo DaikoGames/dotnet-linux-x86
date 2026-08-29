@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Final Fixed)
+name: Build & Test .NET 9 Linux x86 (Final Fixed SDK Resolution)
 
 on:
   push:
@@ -42,19 +42,22 @@ jobs:
         sudo ./eng/common/cross/build-rootfs.sh x86
 
     # ========================================================================
-    # THE FIX: Pre-download SDK, Patch the RID Graph, and Lock the Version
+    # THE FIX: Read global.json, download THAT version, and patch it
     # ========================================================================
     - name: Install and Patch .NET SDK
+      working-directory: runtime
       run: |
+        # 1. Get the exact SDK version required by the repo's global.json
+        SDK_VERSION=$(python3 -c "import json; print(json.load(open('global.json'))['sdk']['version'])")
+        echo "Required SDK version: $SDK_VERSION"
+        
+        # 2. Download that exact version into the repo's local .dotnet folder
         mkdir -p .dotnet
         wget https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
         chmod +x dotnet-install.sh
-        ./dotnet-install.sh --channel 9.0 --install-dir .dotnet
+        ./dotnet-install.sh --version $SDK_VERSION --install-dir .dotnet
         
-        SDK_VERSION=$(ls .dotnet/sdk | head -n 1)
-        echo "SDK_VERSION=$SDK_VERSION" >> $GITHUB_ENV
-        
-        # Patch the SDK's RuntimeIdentifierGraph.json to allow linux-x86
+        # 3. Patch the SDK's RuntimeIdentifierGraph.json to allow linux-x86
         python3 -c "
         import json
         path = '.dotnet/sdk/$SDK_VERSION/RuntimeIdentifierGraph.json'
@@ -67,24 +70,12 @@ jobs:
         print('Successfully patched RuntimeIdentifierGraph.json')
         "
 
-    - name: Lock global.json to Patched SDK Version
-      working-directory: runtime
-      run: |
-        # Prevent build.sh from downloading a different, unpatched SDK version
-        python3 -c "
-        import json
-        with open('global.json', 'r') as f:
-            data = json.load(f)
-        data['sdk']['version'] = '${{ env.SDK_VERSION }}'
-        with open('global.json', 'w') as f:
-            json.dump(data, f, indent=2)
-        "
-
     - name: Build CoreCLR and Libraries
       working-directory: runtime
       env:
         ROOTFS_DIR: ${{ github.workspace }}/runtime/.tools/rootfs/x86
-        DOTNET_INSTALL_DIR: ${{ github.workspace }}/.dotnet
+        # Ensure build.sh uses the .dotnet folder we just populated
+        DOTNET_INSTALL_DIR: ${{ github.workspace }}/runtime/.dotnet
         DOTNET_MULTILEVEL_LOOKUP: 0
       run: |
         # /p:BuildAppHost=false ensures MSBuild never tries to validate the apphost for linux-x86
