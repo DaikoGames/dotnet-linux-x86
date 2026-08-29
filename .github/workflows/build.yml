@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Final Fixed SDK Resolution)
+name: Build & Test .NET 9 Linux x86 (Final Fixed Dependencies)
 
 on:
   push:
@@ -24,11 +24,12 @@ jobs:
         ref: release/9.0
         path: runtime
 
-    - name: Install System Dependencies
+    - name: Install System Dependencies (Including 32-bit LTTng & Unwind)
       run: |
         sudo dpkg --add-architecture i386
         sudo apt-get update
-        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libssl-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3
+        # ADDED: liblttng-ust-dev:i386 and libunwind-dev:i386 to satisfy the 32-bit rootfs CMake checks
+        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libssl-dev:i386 liblttng-ust-dev:i386 libunwind-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3
 
     - name: Setup ccache
       run: |
@@ -39,11 +40,9 @@ jobs:
     - name: Build x86 Cross-Compilation RootFS
       working-directory: runtime
       run: |
+        # This builds the 32-bit (i386) chroot environment
         sudo ./eng/common/cross/build-rootfs.sh x86
 
-    # ========================================================================
-    # THE FIX: Read global.json, download THAT version, and patch it
-    # ========================================================================
     - name: Install and Patch .NET SDK
       working-directory: runtime
       run: |
@@ -74,11 +73,10 @@ jobs:
       working-directory: runtime
       env:
         ROOTFS_DIR: ${{ github.workspace }}/runtime/.tools/rootfs/x86
-        # Ensure build.sh uses the .dotnet folder we just populated
         DOTNET_INSTALL_DIR: ${{ github.workspace }}/runtime/.dotnet
         DOTNET_MULTILEVEL_LOOKUP: 0
       run: |
-        # /p:BuildAppHost=false ensures MSBuild never tries to validate the apphost for linux-x86
+        # This command explicitly targets 32-bit x86 (-arch x86) and cross-compiles (-cross)
         ./build.sh -os linux -arch x86 -c Release -subset clr+libs -cross --ninja \
           /p:UseNinja=true \
           /p:InvariantGlobalization=false \
