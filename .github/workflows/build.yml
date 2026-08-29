@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 Self-Contained Abomination
+name: Build & Test .NET 9 Linux x86 (Fixed NETSDK1084)
 
 on:
   push:
@@ -30,15 +30,12 @@ jobs:
       run: |
         sudo dpkg --add-architecture i386
         sudo apt-get update
-        
-        # 1. Build dependencies + debootstrap
+        # Build deps + debootstrap
         sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libssl-dev:i386 debootstrap qemu-user-static binutils
-        
-        # 2. Execution dependencies (Allows the x64 runner to execute our 32-bit x86 binaries later)
+        # Execution deps (allows x64 runner to test our x86 binary later)
         sudo apt-get install -y libc6:i386 libstdc++6:i386 libgcc-s1:i386
-        
-        # 3. Build tools
-        sudo apt-get install -y cmake ninja-build ccache clang
+        # Build tools
+        sudo apt-get install -y cmake ninja-build ccache clang python3
 
     - name: Setup ccache for 10-minute builds
       run: |
@@ -49,39 +46,47 @@ jobs:
     - name: Build x86 Cross-Compilation RootFS
       working-directory: runtime
       run: |
-        # This creates the 32-bit environment in .tools/rootfs/x86
         sudo ./eng/common/cross/build-rootfs.sh x86
 
-    - name: Build CoreCLR, Libraries, and Host
+    - name: Patch RuntimeIdentifierGraph to Allow linux-x86
+      working-directory: runtime
+      run: |
+        # Microsoft deleted linux-x86. We inject it back into the graph so MSBuild shuts up.
+        python3 -c '
+        import json
+        path = "eng/RuntimeIdentifierGraph.json"
+        with open(path, "r") as f: data = json.load(f)
+        data["runtimes"]["linux-x86"] = { "#import": ["linux"] }
+        with open(path, "w") as f: json.dump(data, f, indent=2)
+        '
+        echo "Patched RuntimeIdentifierGraph.json successfully."
+
+    - name: Build CoreCLR and Libraries (Bypassing Host/NETSDK1084)
       working-directory: runtime
       env:
-        # CRITICAL FIX: Explicitly tell the build script WHERE the rootfs is located
         ROOTFS_DIR: ${{ github.workspace }}/runtime/.tools/rootfs/x86
       run: |
-        # FIXED: Changed '-architecture x86' to '-arch x86' (the correct Arcade build switch)
-        # Also simplified configuration flags to match .NET 9 build.sh expectations
-        ./build.sh -arch x86 \
-                   -c Release \
-                   -subset clr+libs+host \
-                   -cross \
-                   --ninja \
-                   /p:UseNinja=true \
-                   /p:InvariantGlobalization=false \
-                   /p:EnableNativeAOT=false
+        # CRITICAL FIX: We build 'clr+libs' ONLY. 
+        # We intentionally OMIT 'host' because building the official dotnet apphost 
+        # for a deprecated RID triggers the NETSDK1084 error in Arcade.
+        # This gives us 'corerun', which is the raw execution engine we need.
+        ./build.sh -os linux -arch x86 -c Release -subset clr+libs -cross --ninja /p:UseNinja=true /p:InvariantGlobalization=false
 
-    - name: Package Self-Contained Runtime
+    - name: Package Self-Contained Runtime (Using corerun)
       run: |
         mkdir -p dotnet-portable-x86
-        # Copy the custom built coreclr, libs, and host
-        cp -r runtime/artifacts/bin/corehost/Linux.x86.Release/* dotnet-portable-x86/
-        cp -r runtime/artifacts/bin/coreclr/Linux.x86.Release/* dotnet-portable-x86/
-        cp -r runtime/artifacts/bin/System.Private.CoreLib/Linux.x86.Release/* dotnet-portable-x86/
         
-        # Copy all the managed BCL DLLs
+        # 1. Copy corerun (The lightweight host that bypasses RID checks)
+        cp runtime/artifacts/bin/coreclr/Linux.x86.Release/corerun dotnet-portable-x86/
+        
+        # 2. Copy ALL CoreCLR native binaries (.so files)
+        cp runtime/artifacts/bin/coreclr/Linux.x86.Release/*.so dotnet-portable-x86/
+        
+        # 3. Copy the core managed library
+        cp runtime/artifacts/bin/System.Private.CoreLib/Linux.x86.Release/System.Private.CoreLib.dll dotnet-portable-x86/
+        
+        # 4. Copy all other framework DLLs
         find runtime/artifacts/bin/runtime/ -name "*.dll" -exec cp {} dotnet-portable-x86/ \;
-        
-        # Copy native dependencies (libSystem.Native, etc.)
-        find runtime/artifacts/bin/native/ -name "*.so" -exec cp {} dotnet-portable-x86/ \;
 
     - name: Create "Run From Anywhere" Launcher
       run: |
@@ -89,8 +94,8 @@ jobs:
         #!/bin/bash
         DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
         export DOTNET_ROOT="$DIR"
-        export PATH="$DIR:$PATH"
-        exec "$DIR/dotnet" "$@"
+        # corerun executes the DLL directly, no complex apphost resolution needed
+        exec "$DIR/corerun" "$@"
         EOF
         chmod +x dotnet-portable-x86/run.sh
 
@@ -116,33 +121,20 @@ jobs:
         class Program {
             static int Main() {
                 Console.WriteLine("=== Starting IL Stress Test for Linux x86 ===");
-                
-                // 1. Test SSE/Math (Verifies 16-byte stack alignment fix)
                 double result = 0;
                 for(int i=0; i<10000; i++) result += Math.Sin(i) * Math.Cos(i);
                 Console.WriteLine($"[PASS] Math/SSE Stack Alignment: {result}");
-
-                // 2. Test Threading/TLS (Verifies global-dynamic TLS fix)
-                Parallel.For(0, 100, i => {
-                    Thread.Sleep(1);
-                    int threadId = Thread.CurrentThread.ManagedThreadId;
-                });
+                Parallel.For(0, 100, i => { Thread.Sleep(1); });
                 Console.WriteLine("[PASS] Threading & TLS");
-
-                // 3. Test GC & Memory (Verifies 32-bit address space & W^X JIT memory)
                 byte[][] arrays = new byte[100][];
-                for(int i=0; i<100; i++) arrays[i] = new byte[1024 * 1024]; // 100MB
+                for(int i=0; i<100; i++) arrays[i] = new byte[1024 * 1024]; 
                 GC.Collect();
                 Console.WriteLine("[PASS] GC & Memory Allocation");
-
-                // 4. Test P/Invoke (Verifies Linux x86 calling conventions)
                 int pid = getpid();
                 Console.WriteLine($"[PASS] P/Invoke (libc getpid): {pid}");
-
                 Console.WriteLine("=== ALL IL TESTS PASSED! RUNTIME IS STABLE ===");
                 return 0;
             }
-
             [DllImport("libc")]
             static extern int getpid();
         }
@@ -155,8 +147,9 @@ jobs:
 
     - name: Execute IL Stress Test on Custom x86 Runtime
       run: |
-        # This is the critical moment. We run the compiled IL using OUR custom portable x86 runtime.
-        ./dotnet-portable-x86/run.sh exec ./IL_Stress_Test/bin/Release/net9.0/IL_Stress_Test.dll
+        # We use our custom 'corerun' launcher. If the IL fixes work, this passes.
+        # If the stack alignment or TLS fixes failed, this will segfault and fail the build.
+        ./dotnet-portable-x86/run.sh ./IL_Stress_Test/bin/Release/net9.0/IL_Stress_Test.dll
 
     - name: Zip the Final Abomination
       if: success()
