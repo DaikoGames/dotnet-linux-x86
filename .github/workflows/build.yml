@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Final Fixed Dependencies)
+name: Build & Test .NET 9 Linux x86 (Final Fixed LTTng)
 
 on:
   push:
@@ -24,12 +24,13 @@ jobs:
         ref: release/9.0
         path: runtime
 
-    - name: Install System Dependencies (Including 32-bit LTTng & Unwind)
+    - name: Install System Dependencies
       run: |
         sudo dpkg --add-architecture i386
         sudo apt-get update
-        # ADDED: liblttng-ust-dev:i386 and libunwind-dev:i386 to satisfy the 32-bit rootfs CMake checks
-        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libssl-dev:i386 liblttng-ust-dev:i386 libunwind-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3
+        # REMOVED liblttng-ust-dev:i386 (doesn't exist in Ubuntu 24.04). 
+        # We will disable LTTng via CMake instead.
+        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libssl-dev:i386 libunwind-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3
 
     - name: Setup ccache
       run: |
@@ -76,11 +77,12 @@ jobs:
         DOTNET_INSTALL_DIR: ${{ github.workspace }}/runtime/.dotnet
         DOTNET_MULTILEVEL_LOOKUP: 0
       run: |
-        # This command explicitly targets 32-bit x86 (-arch x86) and cross-compiles (-cross)
+        # ADDED: -cmakeargs "-DFEATURE_EVENT_TRACE=0" to completely bypass the missing liblttng-ust-dev requirement
         ./build.sh -os linux -arch x86 -c Release -subset clr+libs -cross --ninja \
           /p:UseNinja=true \
           /p:InvariantGlobalization=false \
-          /p:BuildAppHost=false
+          /p:BuildAppHost=false \
+          -cmakeargs "-DFEATURE_EVENT_TRACE=0"
 
     - name: Package Self-Contained Runtime (Using corerun)
       run: |
