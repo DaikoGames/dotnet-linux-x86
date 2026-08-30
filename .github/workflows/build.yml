@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Surgical LTTng Bypass)
+name: Build & Test .NET 9 Linux x86 (Memory-Safe 32-bit Fix)
 
 on:
   push:
@@ -87,32 +87,43 @@ jobs:
           /p:InvariantGlobalization=false \
           /p:BuildAppHost=false
 
-    - name: Package Self-Contained Runtime (Dynamic Path Resolution)
+    - name: Package Self-Contained Runtime (Minimal 32-bit Safe)
       run: |
         mkdir -p dotnet-portable-x86
         
-        # List what was actually built to debug any future path issues
-        echo "=== Contents of artifacts/bin ==="
-        ls -R runtime/artifacts/bin/ || true
+        # 1. Find the coreclr build directory (case-insensitive to handle Linux/macOS path variations)
+        CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d -iname "linux.x86.release" | head -n 1)
+        echo "Found CoreCLR dir: $CORECLR_DIR"
         
-        # Dynamically find and copy corerun (handles any case-sensitivity or path variations)
-        find runtime/artifacts/bin -iname "corerun" -type f -exec cp {} dotnet-portable-x86/ \;
+        # 2. Copy corerun and native .so files
+        cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
+        cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
         
-        # Dynamically find and copy all .so files from the coreclr build
-        find runtime/artifacts/bin/coreclr -name "*.so" -type f -exec cp {} dotnet-portable-x86/ \;
+        # 3. Copy System.Private.CoreLib.dll
+        find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
         
-        # Dynamically find and copy System.Private.CoreLib.dll
-        find runtime/artifacts/bin -iname "System.Private.CoreLib.dll" -type f -exec cp {} dotnet-portable-x86/ \;
+        # 4. Find the netcoreapp runtime directory for the rest of the Base Class Library
+        RUNTIME_DIR=$(find runtime/artifacts/bin/runtime/netcoreapp -type d -iname "linux.x86.release" | head -n 1)
+        echo "Found Runtime dir: $RUNTIME_DIR"
         
-        # Copy all other framework DLLs
-        find runtime/artifacts/bin -name "*.dll" -type f -exec cp {} dotnet-portable-x86/ \;
+        if [ -n "$RUNTIME_DIR" ]; then
+          # CRITICAL: Copy ONLY the top-level DLLs from the netcoreapp directory.
+          # We use -maxdepth 1 to avoid copying test assets, build tools, or native DLLs 
+          # for other architectures. This prevents 32-bit virtual memory exhaustion (0x8007000e).
+          find "$RUNTIME_DIR" -maxdepth 1 -name "*.dll" -exec cp {} dotnet-portable-x86/ \;
+        else
+          echo "Warning: Could not find netcoreapp runtime directory."
+        fi
         
-        # Verify corerun was actually found
-        if [ ! -f dotnet-portable-x86/corerun ]; then
-          echo "ERROR: corerun was not found in the build artifacts!"
+        # Verify essential files exist
+        if [ ! -f dotnet-portable-x86/corerun ] || [ ! -f dotnet-portable-x86/System.Private.CoreLib.dll ]; then
+          echo "ERROR: Essential runtime files were not found!"
+          ls -la dotnet-portable-x86/ || true
           exit 1
         fi
-        echo "Successfully packaged runtime with corerun"
+        
+        echo "Successfully packaged minimal runtime. File count:"
+        ls -1 dotnet-portable-x86/*.dll | wc -l
 
     - name: Create "Run From Anywhere" Launcher
       run: |
