@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Final Definitive Fix)
+name: Build & Test .NET 9 Linux x86 (Surgical LTTng Fix)
 
 on:
   push:
@@ -28,8 +28,6 @@ jobs:
       run: |
         sudo dpkg --add-architecture i386
         sudo apt-get update
-        # Note: liblttng-ust-dev:i386 is omitted because Ubuntu 24.04 dropped it.
-        # We will use the official dummyprovider fallback instead.
         sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libssl-dev:i386 libunwind-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3
 
     - name: Setup ccache
@@ -43,30 +41,30 @@ jobs:
       run: |
         sudo ./eng/common/cross/build-rootfs.sh x86
 
-    - name: Replace LTTng Provider with Dummy Provider (Official Fallback)
+    - name: Surgically Patch CoreCLR to Disable LTTng
       working-directory: runtime
       run: |
-        # Ubuntu 24.04 dropped i386 liblttng-ust-dev. 
-        # We replace the lttngprovider with the dummyprovider, which provides the 
-        # exact same 'eventprovider' target without requiring LTTng libraries.
-        rm -rf src/coreclr/pal/src/eventprovider/lttngprovider
-        cp -r src/coreclr/pal/src/eventprovider/dummyprovider src/coreclr/pal/src/eventprovider/lttngprovider
-        echo "Successfully replaced lttngprovider with dummyprovider"
+        # 1. Prevent the FATAL_ERROR in configure.cmake
+        sed -i 's/if(NOT HAVE_LTTNG_TRACEPOINT_H AND FEATURE_EVENT_TRACE)/if(FALSE)/' src/coreclr/pal/src/configure.cmake
+        
+        # 2. Comment out the find_library and remove the ${LTTNG} variable in lttngprovider
+        # This surgically removes the dependency on the missing i386 library without breaking the build.
+        sed -i 's/find_library(LTTNG NAMES lttng-ust)/# find_library(LTTNG NAMES lttng-ust) # Disabled for x86 cross-compilation/' src/coreclr/pal/src/eventprovider/lttngprovider/CMakeLists.txt
+        sed -i 's/${LTTNG}//' src/coreclr/pal/src/eventprovider/lttngprovider/CMakeLists.txt
+        
+        echo "Successfully patched CoreCLR to ignore missing LTTng"
 
     - name: Install and Patch .NET SDK
       working-directory: runtime
       run: |
-        # 1. Get the exact SDK version required by the repo's global.json
         SDK_VERSION=$(python3 -c "import json; print(json.load(open('global.json'))['sdk']['version'])")
         echo "Required SDK version: $SDK_VERSION"
         
-        # 2. Download that exact version into the repo's local .dotnet folder
         mkdir -p .dotnet
         wget -q https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
         chmod +x dotnet-install.sh
         ./dotnet-install.sh --version $SDK_VERSION --install-dir .dotnet
         
-        # 3. Patch the SDK's RuntimeIdentifierGraph.json to allow linux-x86
         python3 -c "
         import json
         path = '.dotnet/sdk/$SDK_VERSION/RuntimeIdentifierGraph.json'
@@ -86,26 +84,17 @@ jobs:
         DOTNET_INSTALL_DIR: ${{ github.workspace }}/runtime/.dotnet
         DOTNET_MULTILEVEL_LOOKUP: 0
       run: |
-        # With the dummyprovider in place, this will now compile cleanly and quickly.
         ./build.sh -os linux -arch x86 -c Release -subset clr+libs -cross --ninja \
           /p:UseNinja=true \
           /p:InvariantGlobalization=false \
           /p:BuildAppHost=false
 
-    - name: Package Self-Contained Runtime (Using corerun)
+    - name: Package Self-Contained Runtime
       run: |
         mkdir -p dotnet-portable-x86
-        
-        # 1. Copy corerun (The lightweight host that bypasses all RID/AppHost checks)
         cp runtime/artifacts/bin/coreclr/Linux.x86.Release/corerun dotnet-portable-x86/
-        
-        # 2. Copy ALL CoreCLR native binaries (.so files)
         cp runtime/artifacts/bin/coreclr/Linux.x86.Release/*.so dotnet-portable-x86/
-        
-        # 3. Copy the core managed library
         cp runtime/artifacts/bin/System.Private.CoreLib/Linux.x86.Release/System.Private.CoreLib.dll dotnet-portable-x86/
-        
-        # 4. Copy all other framework DLLs
         find runtime/artifacts/bin/runtime/ -name "*.dll" -exec cp {} dotnet-portable-x86/ \;
 
     - name: Create "Run From Anywhere" Launcher
@@ -114,15 +103,11 @@ jobs:
         #!/bin/bash
         DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
         export DOTNET_ROOT="$DIR"
-        # corerun executes the DLL directly, no complex apphost resolution needed
         exec "$DIR/corerun" "$@"
         EOF
         chmod +x dotnet-portable-x86/run.sh
 
-    # ==========================================
-    # THE TESTING PHASE
-    # ==========================================
-    - name: Install Standard .NET 9 SDK (For compiling the test app)
+    - name: Install Standard .NET 9 SDK
       run: |
         wget -q https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
         chmod +x dotnet-install.sh
@@ -131,7 +116,6 @@ jobs:
     - name: Create IL Stress Test Project
       run: |
         ./dotnet-sdk/dotnet new console -n IL_Stress_Test -o IL_Stress_Test --framework net9.0
-        
         cat << 'CSHARP' > IL_Stress_Test/Program.cs
         using System;
         using System.Threading;
@@ -167,7 +151,6 @@ jobs:
 
     - name: Execute IL Stress Test on Custom x86 Runtime
       run: |
-        # If the IL fixes work, this passes. If stack alignment or TLS fixes failed, this will segfault.
         ./dotnet-portable-x86/run.sh ./IL_Stress_Test/bin/Release/net9.0/IL_Stress_Test.dll
 
     - name: Zip the Final Abomination
