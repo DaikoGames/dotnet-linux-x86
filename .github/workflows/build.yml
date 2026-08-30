@@ -1,46 +1,28 @@
-name: Build & Test .NET 9 Linux x86 (TRUE 32-Bit Docker Fallback)
+name: Build & Test .NET 9 Linux x86 (Kernel Limits Fix)
 
 on:
   push:
     branches: [ "main" ]
   workflow_dispatch:
 
+env:
+  UseNinja: true
+  CMAKE_GENERATOR: Ninja
+  CFLAGS: "-mstackrealign -fPIC"
+  CXXFLAGS: "-mstackrealign -fPIC -ftls-model=global-dynamic"
+  LDFLAGS: "-Wl,-z,noexecstack"
+
 jobs:
   build-and-test-linux-x86:
-    # CRITICAL: Force GitHub to run this job inside a 32-bit (i386) Ubuntu 22.04 container.
-    # GitHub will automatically use QEMU to emulate the 32-bit environment.
     runs-on: ubuntu-latest
-    container:
-      image: i386/ubuntu:22.04
-      options: --privileged 
-
-    env:
-      UseNinja: true
-      CMAKE_GENERATOR: Ninja
-      # Wir behalten deine entscheidenden IL-Fixes bei!
-      CFLAGS: "-mstackrealign -fPIC"
-      CXXFLAGS: "-mstackrealign -fPIC -ftls-model=global-dynamic"
-      LDFLAGS: "-Wl,-z,noexecstack"
-      # Verhindert, dass die GC versucht, zu viel Speicher im emulierten 32-Bit-Raum zu reservieren
-      DOTNET_GCHeapHardLimit: "0x40000000" # 1GB
-      DEBIAN_FRONTEND: noninteractive
-
+    
     steps:
-    - name: Install System Dependencies (Native 32-bit)
+    # CRITICAL FIX 1: Increase Linux kernel memory map limit.
+    # GitHub Actions default is 65530, which causes .NET 32-bit to crash with 0x8007000E (ENOMEM).
+    - name: Increase Kernel max_map_count
       run: |
-        apt-get update
-        # Grundlegende Build-Tools
-        apt-get install -y wget curl python3 git cmake ninja-build ccache clang file
-        
-        # Native 32-Bit-Abhängigkeiten (Kein :i386-Suffix nötig, wir SIND bereits i386!)
-        # Ubuntu 22.04 wird verwendet, da 24.04 viele 32-Bit-Pakete entfernt hat
-        apt-get install -y gcc g++ zlib1g-dev libicu-dev libssl-dev libunwind-dev libc6-dev libstdc++-11-dev
-
-    - name: Setup ccache
-      run: |
-        export PATH="/usr/lib/ccache:$PATH"
-        ccache -M 1.5G
-        ccache -z
+        sudo sysctl -w vm.max_map_count=262144
+        echo "vm.max_map_count set to $(sysctl vm.max_map_count)"
 
     - name: Checkout .NET 9 Runtime
       uses: actions/checkout@v4
@@ -48,6 +30,30 @@ jobs:
         repository: dotnet/runtime
         ref: release/9.0
         path: runtime
+
+    - name: Install System Dependencies
+      run: |
+        sudo dpkg --add-architecture i386
+        sudo apt-get update
+        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libicu74:i386 libssl-dev:i386 libssl3:i386 libunwind-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3 file util-linux
+
+    - name: Setup ccache
+      run: |
+        echo "/usr/lib/ccache" >> $GITHUB_PATH
+        ccache -M 2.0G
+        ccache -z
+
+    - name: Build x86 Cross-Compilation RootFS
+      working-directory: runtime
+      run: |
+        sudo ./eng/common/cross/build-rootfs.sh x86
+
+    - name: Surgically Patch CoreCLR to Use Dummy Provider
+      working-directory: runtime
+      run: |
+        sed -i 's/if(NOT HAVE_LTTNG_TRACEPOINT_H AND FEATURE_EVENT_TRACE)/if(FALSE)/' src/coreclr/pal/src/configure.cmake
+        sed -i 's/if(CLR_CMAKE_HOST_LINUX)/if(FALSE) # Always use dummyprovider to avoid LTTng dependency/' src/coreclr/pal/src/eventprovider/CMakeLists.txt
+        echo "Successfully patched CoreCLR to use dummyprovider"
 
     - name: Install and Patch .NET SDK
       working-directory: runtime
@@ -60,7 +66,6 @@ jobs:
         chmod +x dotnet-install.sh
         ./dotnet-install.sh --version $SDK_VERSION --install-dir .dotnet
         
-        # Patch RID Graph, um linux-x86 zu erlauben
         python3 -c "
         import json
         path = '.dotnet/sdk/$SDK_VERSION/RuntimeIdentifierGraph.json'
@@ -73,20 +78,19 @@ jobs:
         print('Successfully patched RuntimeIdentifierGraph.json')
         "
 
-    - name: Build CoreCLR and Libraries (NATIVE 32-bit build)
+    - name: Build CoreCLR and Libraries
       working-directory: runtime
       env:
+        ROOTFS_DIR: ${{ github.workspace }}/runtime/.tools/rootfs/x86
         DOTNET_INSTALL_DIR: ${{ github.workspace }}/runtime/.dotnet
         DOTNET_MULTILEVEL_LOOKUP: 0
       run: |
-        # WICHTIG: KEIN '-cross' Flag! Wir bauen nativ innerhalb des 32-Bit-Containers.
-        # Das vermeidet alle Cross-Compiling-Pfad-Probleme.
-        ./build.sh -os linux -arch x86 -c Release -subset clr+libs --ninja \
+        ./build.sh -os linux -arch x86 -c Release -subset clr+libs -cross --ninja \
           /p:UseNinja=true \
           /p:InvariantGlobalization=false \
           /p:BuildAppHost=false
 
-    - name: Package Self-Contained Runtime
+    - name: Package Self-Contained Runtime (Strict 32-bit Match)
       run: |
         mkdir -p dotnet-portable-x86
         
@@ -115,29 +119,35 @@ jobs:
 
     - name: Diagnostic Architecture Check
       run: |
-        echo "=== Architecture Check (MUST say 32-bit) ==="
+        echo "=== Architecture of corerun ==="
         file dotnet-portable-x86/corerun
+        echo "=== Architecture of libcoreclr.so ==="
         file dotnet-portable-x86/libcoreclr.so
 
-    - name: Create "Run From Anywhere" Launcher
+    - name: Create "Run From Anywhere" Launcher (WITH ALL FIXES)
       run: |
         cat << 'EOF' > dotnet-portable-x86/run.sh
         #!/bin/bash
         DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
         export DOTNET_ROOT="$DIR"
+        
+        # CRITICAL FIX 2: Hard limit GC to 1GB to prevent virtual memory exhaustion
+        export DOTNET_GCHeapHardLimit=0x40000000
         export DOTNET_TieredCompilation=0
-        exec "$DIR/corerun" "$@"
+        
+        # CRITICAL FIX 3: Use setarch to disable ASLR (-R) for this 32-bit process.
+        # This prevents the 64-bit kernel from fragmenting the 32-bit address space.
+        exec setarch i686 -R "$DIR/corerun" "$@"
         EOF
         chmod +x dotnet-portable-x86/run.sh
 
-    - name: Install Standard .NET 9 SDK (for testing)
+    - name: Install Standard .NET 9 SDK
       run: |
         wget -q https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
         chmod +x dotnet-install.sh
-        # Wir installieren das x64 SDK nur, um die Test-App zu kompilieren. Die App selbst wird für linux-x86 gebaut.
         ./dotnet-install.sh --channel 9.0 --install-dir ./dotnet-sdk
 
-    - name: Create & Compile IL Stress Test
+    - name: Create IL Stress Test Project
       run: |
         ./dotnet-sdk/dotnet new console -n IL_Stress_Test -o IL_Stress_Test --framework net9.0
         cat << 'CSHARP' > IL_Stress_Test/Program.cs
@@ -167,13 +177,16 @@ jobs:
             static extern int getpid();
         }
         CSHARP
-        ./dotnet-sdk/dotnet build IL_Stress_Test -c Release
 
-    - name: Execute IL Stress Test
+    - name: Compile IL Stress Test
+      working-directory: IL_Stress_Test
+      run: |
+        ../dotnet-sdk/dotnet build -c Release
+
+    - name: Execute IL Stress Test on Custom x86 Runtime
       run: |
         ./dotnet-portable-x86/run.sh ./IL_Stress_Test/bin/Release/net9.0/IL_Stress_Test.dll
 
-    # KORRIGIERT: In zwei separate Steps aufgeteilt
     - name: Zip the Final Abomination
       if: success()
       run: |
@@ -183,6 +196,6 @@ jobs:
       if: success()
       uses: actions/upload-artifact@v4
       with:
-        name: dotnet9-linux-x86-true-32bit
+        name: dotnet9-linux-x86-selfcontained-tested
         path: dotnet9-linux-x86-portable.zip
         retention-days: 7
