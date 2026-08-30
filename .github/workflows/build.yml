@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Diagnostic & Dependency Fix)
+name: Build & Test .NET 9 Linux x86 (GC Memory Limit Fix)
 
 on:
   push:
@@ -24,12 +24,11 @@ jobs:
         ref: release/9.0
         path: runtime
 
-    - name: Install System Dependencies (Including Explicit 32-bit Runtimes)
+    - name: Install System Dependencies
       run: |
         sudo dpkg --add-architecture i386
         sudo apt-get update
-        # Explicitly install BOTH dev and runtime 32-bit packages for Ubuntu 24.04
-        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libicu74:i386 libssl-dev:i386 libssl3:i386 libunwind-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3
+        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libicu74:i386 libssl-dev:i386 libssl3:i386 libunwind-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3 file
 
     - name: Setup ccache
       run: |
@@ -88,7 +87,8 @@ jobs:
       run: |
         mkdir -p dotnet-portable-x86
         
-        CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d -iname "linux.x86.release" | head -n 1)
+        # Find the exact x86 release directory
+        CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d -iname "*linux*x86*release*" | head -n 1)
         echo "Found CoreCLR dir: $CORECLR_DIR"
         
         cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
@@ -105,22 +105,27 @@ jobs:
           exit 1
         fi
 
-    - name: Check Native Dependencies (Diagnostic)
+    - name: Diagnostic Architecture Check
       run: |
+        echo "=== Architecture of corerun ==="
+        file dotnet-portable-x86/corerun
+        echo "=== Architecture of libcoreclr.so ==="
+        file dotnet-portable-x86/libcoreclr.so
         echo "=== ldd corerun ==="
         ldd dotnet-portable-x86/corerun || true
-        echo "=== ldd libcoreclr.so ==="
-        ldd dotnet-portable-x86/libcoreclr.so || true
 
-    - name: Create "Run From Anywhere" Launcher (With Tracing)
+    - name: Create "Run From Anywhere" Launcher (With GC Memory Limits)
       run: |
         cat << 'EOF' > dotnet-portable-x86/run.sh
         #!/bin/bash
         DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
         export DOTNET_ROOT="$DIR"
-        # Enable CoreCLR tracing to see EXACTLY why it fails to initialize
-        export CORECLR_TRACE=1
-        export COREHOST_TRACE=1
+        
+        # CRITICAL FIX: Limit GC virtual memory reservation to 50% to prevent 
+        # 32-bit Linux E_OUTOFMEMORY (0x8007000E) during coreclr_initialize.
+        export DOTNET_GCHeapHardLimitPercent=50
+        export DOTNET_TieredCompilation=0
+        
         exec "$DIR/corerun" "$@"
         EOF
         chmod +x dotnet-portable-x86/run.sh
