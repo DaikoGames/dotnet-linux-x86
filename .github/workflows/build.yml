@@ -48,7 +48,6 @@ jobs:
         sed -i 's/if(NOT HAVE_LTTNG_TRACEPOINT_H AND FEATURE_EVENT_TRACE)/if(FALSE)/' src/coreclr/pal/src/configure.cmake
         
         # 2. Force CMake to ALWAYS use the dummyprovider instead of lttngprovider on Linux.
-        # This prevents the Python script from generating C++ files that try to include <lttng/tracepoint.h>
         sed -i 's/if(CLR_CMAKE_HOST_LINUX)/if(FALSE) # Always use dummyprovider to avoid LTTng dependency/' src/coreclr/pal/src/eventprovider/CMakeLists.txt
         
         echo "Successfully patched CoreCLR to use dummyprovider and ignore missing LTTng"
@@ -88,13 +87,32 @@ jobs:
           /p:InvariantGlobalization=false \
           /p:BuildAppHost=false
 
-    - name: Package Self-Contained Runtime
+    - name: Package Self-Contained Runtime (Dynamic Path Resolution)
       run: |
         mkdir -p dotnet-portable-x86
-        cp runtime/artifacts/bin/coreclr/Linux.x86.Release/corerun dotnet-portable-x86/
-        cp runtime/artifacts/bin/coreclr/Linux.x86.Release/*.so dotnet-portable-x86/
-        cp runtime/artifacts/bin/System.Private.CoreLib/Linux.x86.Release/System.Private.CoreLib.dll dotnet-portable-x86/
-        find runtime/artifacts/bin/runtime/ -name "*.dll" -exec cp {} dotnet-portable-x86/ \;
+        
+        # List what was actually built to debug any future path issues
+        echo "=== Contents of artifacts/bin ==="
+        ls -R runtime/artifacts/bin/ || true
+        
+        # Dynamically find and copy corerun (handles any case-sensitivity or path variations)
+        find runtime/artifacts/bin -iname "corerun" -type f -exec cp {} dotnet-portable-x86/ \;
+        
+        # Dynamically find and copy all .so files from the coreclr build
+        find runtime/artifacts/bin/coreclr -name "*.so" -type f -exec cp {} dotnet-portable-x86/ \;
+        
+        # Dynamically find and copy System.Private.CoreLib.dll
+        find runtime/artifacts/bin -iname "System.Private.CoreLib.dll" -type f -exec cp {} dotnet-portable-x86/ \;
+        
+        # Copy all other framework DLLs
+        find runtime/artifacts/bin -name "*.dll" -type f -exec cp {} dotnet-portable-x86/ \;
+        
+        # Verify corerun was actually found
+        if [ ! -f dotnet-portable-x86/corerun ]; then
+          echo "ERROR: corerun was not found in the build artifacts!"
+          exit 1
+        fi
+        echo "Successfully packaged runtime with corerun"
 
     - name: Create "Run From Anywhere" Launcher
       run: |
