@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Surgical LTTng Fix)
+name: Build & Test .NET 9 Linux x86 (Surgical LTTng Bypass)
 
 on:
   push:
@@ -41,18 +41,17 @@ jobs:
       run: |
         sudo ./eng/common/cross/build-rootfs.sh x86
 
-    - name: Surgically Patch CoreCLR to Disable LTTng
+    - name: Surgically Patch CoreCLR to Use Dummy Provider
       working-directory: runtime
       run: |
-        # 1. Prevent the FATAL_ERROR in configure.cmake
+        # 1. Prevent the FATAL_ERROR in configure.cmake when it can't find lttng-ust
         sed -i 's/if(NOT HAVE_LTTNG_TRACEPOINT_H AND FEATURE_EVENT_TRACE)/if(FALSE)/' src/coreclr/pal/src/configure.cmake
         
-        # 2. Comment out the find_library and remove the ${LTTNG} variable in lttngprovider
-        # This surgically removes the dependency on the missing i386 library without breaking the build.
-        sed -i 's/find_library(LTTNG NAMES lttng-ust)/# find_library(LTTNG NAMES lttng-ust) # Disabled for x86 cross-compilation/' src/coreclr/pal/src/eventprovider/lttngprovider/CMakeLists.txt
-        sed -i 's/${LTTNG}//' src/coreclr/pal/src/eventprovider/lttngprovider/CMakeLists.txt
+        # 2. Force CMake to ALWAYS use the dummyprovider instead of lttngprovider on Linux.
+        # This prevents the Python script from generating C++ files that try to include <lttng/tracepoint.h>
+        sed -i 's/if(CLR_CMAKE_HOST_LINUX)/if(FALSE) # Always use dummyprovider to avoid LTTng dependency/' src/coreclr/pal/src/eventprovider/CMakeLists.txt
         
-        echo "Successfully patched CoreCLR to ignore missing LTTng"
+        echo "Successfully patched CoreCLR to use dummyprovider and ignore missing LTTng"
 
     - name: Install and Patch .NET SDK
       working-directory: runtime
