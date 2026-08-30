@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (GC Memory Limit Fix)
+name: Build & Test .NET 9 Linux x86 (ASLR & GC Fix)
 
 on:
   push:
@@ -28,7 +28,8 @@ jobs:
       run: |
         sudo dpkg --add-architecture i386
         sudo apt-get update
-        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libicu74:i386 libssl-dev:i386 libssl3:i386 libunwind-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3 file
+        # util-linux enthält 'setarch', das wir für den ASLR-Fix brauchen
+        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libicu74:i386 libssl-dev:i386 libssl3:i386 libunwind-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3 file util-linux
 
     - name: Setup ccache
       run: |
@@ -83,13 +84,19 @@ jobs:
           /p:InvariantGlobalization=false \
           /p:BuildAppHost=false
 
-    - name: Package Self-Contained Runtime
+    - name: Package Self-Contained Runtime (Strict 32-bit Match)
       run: |
         mkdir -p dotnet-portable-x86
         
-        # Find the exact x86 release directory
-        CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d -iname "*linux*x86*release*" | head -n 1)
+        # EXAKTER Match: Nur Verzeichnisse, die exakt "Linux.x86.Release" oder "linux.x86.Release" heißen
+        CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
         echo "Found CoreCLR dir: $CORECLR_DIR"
+        
+        if [ -z "$CORECLR_DIR" ]; then
+          echo "ERROR: Could not find exact x86 release directory!"
+          find runtime/artifacts/bin/coreclr -type d | head -n 10
+          exit 1
+        fi
         
         cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
         cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
@@ -111,22 +118,23 @@ jobs:
         file dotnet-portable-x86/corerun
         echo "=== Architecture of libcoreclr.so ==="
         file dotnet-portable-x86/libcoreclr.so
-        echo "=== ldd corerun ==="
-        ldd dotnet-portable-x86/corerun || true
 
-    - name: Create "Run From Anywhere" Launcher (With GC Memory Limits)
+    - name: Create "Run From Anywhere" Launcher (WITH ASLR FIX)
       run: |
         cat << 'EOF' > dotnet-portable-x86/run.sh
         #!/bin/bash
         DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
         export DOTNET_ROOT="$DIR"
         
-        # CRITICAL FIX: Limit GC virtual memory reservation to 50% to prevent 
-        # 32-bit Linux E_OUTOFMEMORY (0x8007000E) during coreclr_initialize.
-        export DOTNET_GCHeapHardLimitPercent=50
+        # 1. Hard limit GC to 1GB to prevent virtual memory exhaustion
+        export DOTNET_GCHeapHardLimit=0x40000000
         export DOTNET_TieredCompilation=0
         
-        exec "$DIR/corerun" "$@"
+        # 2. CRITICAL FIX: Use setarch to disable ASLR (-R) for this 32-bit process.
+        # On a 64-bit kernel, ASLR fragments the 32-bit address space, causing 
+        # the GC's mmap reservation to fail with E_OUTOFMEMORY (0x8007000E).
+        # Disabling it guarantees contiguous virtual memory is available.
+        exec setarch i686 -R "$DIR/corerun" "$@"
         EOF
         chmod +x dotnet-portable-x86/run.sh
 
