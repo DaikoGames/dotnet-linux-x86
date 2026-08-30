@@ -29,7 +29,7 @@ jobs:
         sudo dpkg --add-architecture i386
         sudo apt-get update
         # Note: liblttng-ust-dev:i386 is omitted because Ubuntu 24.04 dropped it.
-        # We will bypass the check via a source code patch instead.
+        # We will use the official dummyprovider fallback instead.
         sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libssl-dev:i386 libunwind-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3
 
     - name: Setup ccache
@@ -43,13 +43,15 @@ jobs:
       run: |
         sudo ./eng/common/cross/build-rootfs.sh x86
 
-    - name: Patch CoreCLR to Bypass Missing LTTng
+    - name: Replace LTTng Provider with Dummy Provider (Official Fallback)
       working-directory: runtime
       run: |
-        # This is the clean, official workaround used by cross-compilation communities.
-        # It disables the fatal CMake check for liblttng-ust-dev, allowing the build to proceed.
-        sed -i 's/if(NOT HAVE_LTTNG_TRACEPOINT_H AND FEATURE_EVENT_TRACE)/if(FALSE)/' src/coreclr/pal/src/configure.cmake
-        echo "Successfully patched configure.cmake to bypass LTTng check"
+        # Ubuntu 24.04 dropped i386 liblttng-ust-dev. 
+        # We replace the lttngprovider with the dummyprovider, which provides the 
+        # exact same 'eventprovider' target without requiring LTTng libraries.
+        rm -rf src/coreclr/pal/src/eventprovider/lttngprovider
+        cp -r src/coreclr/pal/src/eventprovider/dummyprovider src/coreclr/pal/src/eventprovider/lttngprovider
+        echo "Successfully replaced lttngprovider with dummyprovider"
 
     - name: Install and Patch .NET SDK
       working-directory: runtime
@@ -84,7 +86,7 @@ jobs:
         DOTNET_INSTALL_DIR: ${{ github.workspace }}/runtime/.dotnet
         DOTNET_MULTILEVEL_LOOKUP: 0
       run: |
-        # With the LTTng check patched out, this will now compile cleanly.
+        # With the dummyprovider in place, this will now compile cleanly and quickly.
         ./build.sh -os linux -arch x86 -c Release -subset clr+libs -cross --ninja \
           /p:UseNinja=true \
           /p:InvariantGlobalization=false \
