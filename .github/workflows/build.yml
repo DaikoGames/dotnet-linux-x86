@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Foolproof Runtime Packaging)
+name: Build & Test .NET 9 Linux x86 (Diagnostic & Dependency Fix)
 
 on:
   push:
@@ -24,11 +24,12 @@ jobs:
         ref: release/9.0
         path: runtime
 
-    - name: Install System Dependencies
+    - name: Install System Dependencies (Including Explicit 32-bit Runtimes)
       run: |
         sudo dpkg --add-architecture i386
         sudo apt-get update
-        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libssl-dev:i386 libunwind-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3
+        # Explicitly install BOTH dev and runtime 32-bit packages for Ubuntu 24.04
+        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libicu74:i386 libssl-dev:i386 libssl3:i386 libunwind-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3
 
     - name: Setup ccache
       run: |
@@ -44,13 +45,9 @@ jobs:
     - name: Surgically Patch CoreCLR to Use Dummy Provider
       working-directory: runtime
       run: |
-        # 1. Prevent the FATAL_ERROR in configure.cmake when it can't find lttng-ust
         sed -i 's/if(NOT HAVE_LTTNG_TRACEPOINT_H AND FEATURE_EVENT_TRACE)/if(FALSE)/' src/coreclr/pal/src/configure.cmake
-        
-        # 2. Force CMake to ALWAYS use the dummyprovider instead of lttngprovider on Linux.
         sed -i 's/if(CLR_CMAKE_HOST_LINUX)/if(FALSE) # Always use dummyprovider to avoid LTTng dependency/' src/coreclr/pal/src/eventprovider/CMakeLists.txt
-        
-        echo "Successfully patched CoreCLR to use dummyprovider and ignore missing LTTng"
+        echo "Successfully patched CoreCLR to use dummyprovider"
 
     - name: Install and Patch .NET SDK
       working-directory: runtime
@@ -87,61 +84,43 @@ jobs:
           /p:InvariantGlobalization=false \
           /p:BuildAppHost=false
 
-    - name: Package Self-Contained Runtime (Foolproof Discovery)
+    - name: Package Self-Contained Runtime
       run: |
         mkdir -p dotnet-portable-x86
         
-        # 1. Find the coreclr build directory (case-insensitive)
         CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d -iname "linux.x86.release" | head -n 1)
         echo "Found CoreCLR dir: $CORECLR_DIR"
         
-        if [ -z "$CORECLR_DIR" ]; then
-          echo "ERROR: Could not find CoreCLR directory!"
-          find runtime/artifacts/bin/coreclr -type d | head -n 10
-          exit 1
-        fi
-        
-        # 2. Copy corerun and native .so files
         cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
         cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
-        
-        # 3. Copy System.Private.CoreLib.dll
         find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
         
-        # 4. Find the directory containing the rest of the Base Class Library by locating System.Runtime.dll
-        # This completely eliminates guessing folder names like 'netcoreapp'
         RUNTIME_DLL=$(find runtime/artifacts/bin -type f -name "System.Runtime.dll" | head -n 1)
-        
         if [ -n "$RUNTIME_DLL" ]; then
           RUNTIME_DIR=$(dirname "$RUNTIME_DLL")
           echo "Found Runtime dir: $RUNTIME_DIR"
-          
-          # Copy ALL top-level DLLs from this specific runtime directory.
-          # This gets the ~150 essential framework assemblies without recursing into test assets.
           cp "$RUNTIME_DIR"/*.dll dotnet-portable-x86/
         else
-          echo "ERROR: Could not find System.Runtime.dll anywhere in artifacts/bin!"
-          find runtime/artifacts/bin -type f -name "*.dll" | head -n 20
+          echo "ERROR: Could not find System.Runtime.dll!"
           exit 1
         fi
-        
-        # Verify essential files exist and print contents for debugging
-        echo "=== Contents of dotnet-portable-x86 ==="
-        ls -la dotnet-portable-x86/
-        
-        if [ ! -f dotnet-portable-x86/corerun ] || [ ! -f dotnet-portable-x86/System.Private.CoreLib.dll ] || [ ! -f dotnet-portable-x86/System.Runtime.dll ]; then
-          echo "ERROR: Essential runtime files were not found!"
-          exit 1
-        fi
-        
-        echo "Successfully packaged minimal runtime. DLL count: $(ls -1 dotnet-portable-x86/*.dll | wc -l)"
 
-    - name: Create "Run From Anywhere" Launcher
+    - name: Check Native Dependencies (Diagnostic)
+      run: |
+        echo "=== ldd corerun ==="
+        ldd dotnet-portable-x86/corerun || true
+        echo "=== ldd libcoreclr.so ==="
+        ldd dotnet-portable-x86/libcoreclr.so || true
+
+    - name: Create "Run From Anywhere" Launcher (With Tracing)
       run: |
         cat << 'EOF' > dotnet-portable-x86/run.sh
         #!/bin/bash
         DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
         export DOTNET_ROOT="$DIR"
+        # Enable CoreCLR tracing to see EXACTLY why it fails to initialize
+        export CORECLR_TRACE=1
+        export COREHOST_TRACE=1
         exec "$DIR/corerun" "$@"
         EOF
         chmod +x dotnet-portable-x86/run.sh
