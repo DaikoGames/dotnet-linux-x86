@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Complete TPA Fix + MAX SPEED)
+name: Build & Test .NET 9 Linux x86 (Ultimate Speed + Complete TPA Fix)
 
 on:
   push:
@@ -42,11 +42,10 @@ jobs:
         echo "/usr/lib/ccache" >> $GITHUB_PATH
         # Maximale Cache-Größe für schnelle Re-Builds
         ccache -M 5.0G
-        # Maximale Kompression spart I/O-Zeit
+        # Maximale Kompression spart I/O-Zeit auf dem Runner
         ccache -o compression_level=9
         # Statistiken zurücksetzen
         ccache -z
-        echo "ccache configured for maximum performance"
 
     - name: Build x86 Cross-Compilation RootFS
       working-directory: runtime
@@ -84,14 +83,10 @@ jobs:
         DOTNET_INSTALL_DIR: ${{ github.workspace }}/runtime/.dotnet
         DOTNET_MULTILEVEL_LOOKUP: 0
       run: |
-        # Maximale Parallelität für Ninja und MSBuild
+        # /m und BuildInParallel=true zwingen MSBuild, alle CPU-Kerne zu nutzen
         ./build.sh -os linux -arch x86 -c Release -subset clr+libs -cross --ninja \
-          /p:UseNinja=true \
-          /p:InvariantGlobalization=false \
-          /p:BuildAppHost=false \
-          /p:BuildInParallel=true \
-          /m \
-          -j $(nproc)
+          /p:UseNinja=true /p:InvariantGlobalization=false /p:BuildAppHost=false \
+          /p:BuildInParallel=true /m
 
     - name: Package Self-Contained Runtime (COMBINE CoreCLR + BCL)
       run: |
@@ -115,7 +110,6 @@ jobs:
           cp "$BCL_DIR"/*.dll dotnet-portable-x86/
         else
           echo "FATAL ERROR: Could not find System.Runtime.dll in libs output!"
-          find runtime/artifacts/bin/runtime -name "System.Runtime.dll" | head -n 10
           exit 1
         fi
         
