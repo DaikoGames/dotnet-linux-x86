@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (LD_LIBRARY_PATH Fix)
+name: Build & Test .NET 9 Linux x86 (Complete TPA Fix)
 
 on:
   push:
@@ -82,23 +82,29 @@ jobs:
         ./build.sh -os linux -arch x86 -c Release -subset clr+libs -cross --ninja \
           /p:UseNinja=true /p:InvariantGlobalization=false /p:BuildAppHost=false
 
-    - name: Package Self-Contained Runtime (Targeted Shared Framework)
+    - name: Package Self-Contained Runtime (COMBINE CoreCLR + BCL)
       run: |
         mkdir -p dotnet-portable-x86
         
+        # 1. Copy CoreCLR native binaries & System.Private.CoreLib.dll
         CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
         echo "Found CoreCLR dir: $CORECLR_DIR"
         cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
         cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
+        find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
         
-        CORELIB_PATH=$(find runtime/artifacts/bin -type f -name "System.Private.CoreLib.dll" | grep -i "linux.x86.release" | head -n 1)
+        # 2. CRITICAL FIX: Copy the Base Class Library (BCL) DLLs from the libs output
+        # This is where System.Runtime.dll, System.Console.dll, etc. actually live!
+        RUNTIME_DLL=$(find runtime/artifacts/bin/runtime -type f -name "System.Runtime.dll" | grep -i "linux.x86" | head -n 1)
         
-        if [ -n "$CORELIB_PATH" ]; then
-          CORELIB_DIR=$(dirname "$CORELIB_PATH")
-          echo "Found pure Shared Framework dir: $CORELIB_DIR"
-          cp "$CORELIB_DIR"/*.dll dotnet-portable-x86/
+        if [ -n "$RUNTIME_DLL" ]; then
+          BCL_DIR=$(dirname "$RUNTIME_DLL")
+          echo "Found BCL dir: $BCL_DIR"
+          # Copy ALL top-level BCL DLLs
+          cp "$BCL_DIR"/*.dll dotnet-portable-x86/
         else
-          echo "FATAL ERROR: Could not find System.Private.CoreLib.dll for linux.x86.release!"
+          echo "FATAL ERROR: Could not find System.Runtime.dll in libs output!"
+          find runtime/artifacts/bin/runtime -name "System.Runtime.dll" | head -n 10
           exit 1
         fi
         
@@ -112,25 +118,19 @@ jobs:
           echo "FATAL: corerun is NOT 32-bit!" && exit 1
         fi
         echo "=== ldd check (verifying all .so dependencies are found) ==="
-        # We temporarily set LD_LIBRARY_PATH here just for the ldd check to prove it works
         LD_LIBRARY_PATH="$(pwd)/dotnet-portable-x86" ldd dotnet-portable-x86/corerun || true
 
-    - name: Create "Run From Anywhere" Launcher (WITH LD_LIBRARY_PATH FIX)
+    - name: Create "Run From Anywhere" Launcher
       run: |
         cat << 'EOF' > dotnet-portable-x86/run.sh
         #!/bin/bash
         DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
         export DOTNET_ROOT="$DIR"
-        
-        # CRITICAL FIX: Tell the Linux dynamic linker to look in the current 
-        # directory for libcoreclrpal.so and other native dependencies FIRST.
         export LD_LIBRARY_PATH="$DIR:$LD_LIBRARY_PATH"
-        
         ulimit -v unlimited
         ulimit -m unlimited
         export DOTNET_GCHeapHardLimit=0x40000000
         export DOTNET_TieredCompilation=0
-        
         exec "$DIR/corerun" "$@"
         EOF
         chmod +x dotnet-portable-x86/run.sh
