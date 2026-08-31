@@ -7,7 +7,6 @@ on:
 
 jobs:
   build-and-test-linux-x86:
-    # Use Debian 12 (Bookworm). It has full, official i386 support, unlike Ubuntu 24.04.
     runs-on: ubuntu-latest
     container:
       image: debian:bookworm
@@ -24,23 +23,20 @@ jobs:
     steps:
     - name: Fix Kernel Memory Limits (Host)
       run: |
-        # We need sudo for this, so we install it first
-        apt-get update && apt-get install -y sudo
+        # Install sudo and procps (which contains sysctl)
+        apt-get update && apt-get install -y sudo procps
         sudo sysctl -w vm.overcommit_memory=1
         sudo sysctl -w vm.max_map_count=262144
 
     - name: Install Build Dependencies (Native x64 + i386 Cross)
       run: |
         apt-get update
-        # Install base build tools first
         apt-get install -y wget curl python3 git cmake ninja-build ccache clang file build-essential sudo
         
-        # Enable 32-bit architecture
         dpkg --add-architecture i386
         apt-get update
         
-        # Install 32-bit dependencies. 
-        # NOTE: These ACTUALLY EXIST in Debian Bookworm, unlike Ubuntu 24.04!
+        # These ACTUALLY EXIST in Debian Bookworm!
         apt-get install -y \
           gcc-multilib g++-multilib \
           zlib1g-dev:i386 \
@@ -72,7 +68,6 @@ jobs:
       working-directory: runtime
       run: |
         # This will now succeed perfectly because liblttng-ust-dev:i386 is actually installed!
-        # No sed hacks needed.
         sudo ./eng/common/cross/build-rootfs.sh x86
 
     - name: Install and Patch .NET SDK
@@ -84,10 +79,8 @@ jobs:
         mkdir -p .dotnet
         wget -q https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
         chmod +x dotnet-install.sh
-        # We install the x64 SDK because the Debian container is x64. It will cross-compile to x86.
         ./dotnet-install.sh --version $SDK_VERSION --install-dir .dotnet
         
-        # Patch RID Graph to allow linux-x86
         python3 -c "
         import json
         path = '.dotnet/sdk/$SDK_VERSION/RuntimeIdentifierGraph.json'
@@ -105,8 +98,6 @@ jobs:
         DOTNET_INSTALL_DIR: ${{ github.workspace }}/runtime/.dotnet
         DOTNET_MULTILEVEL_LOOKUP: 0
       run: |
-        # Clean, simple, and fast. Ninja will automatically use all CPU cores.
-        # No hacky MSBuild flags, no sed patches for LTTng.
         ./build.sh clr+libs -c Release -arch x86 -cross --ninja
 
     - name: Package Self-Contained Runtime
