@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Debian Bookworm - The Right Way)
+name: Build & Test .NET 9 Linux x86 (Pure Debian - The Simple Way)
 
 on:
   push:
@@ -21,9 +21,8 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
 
     steps:
-    - name: Fix Kernel Memory Limits (Host)
+    - name: Fix Kernel Memory Limits
       run: |
-        # Install sudo and procps (which contains sysctl)
         apt-get update && apt-get install -y sudo procps
         sudo sysctl -w vm.overcommit_memory=1
         sudo sysctl -w vm.max_map_count=262144
@@ -31,12 +30,12 @@ jobs:
     - name: Install Build Dependencies (Native x64 + i386 Cross)
       run: |
         apt-get update
-        apt-get install -y wget curl python3 git cmake ninja-build ccache clang file build-essential sudo
+        apt-get install -y wget curl python3 git cmake ninja-build ccache clang file build-essential sudo debootstrap qemu-user-static
         
         dpkg --add-architecture i386
         apt-get update
         
-        # These ACTUALLY EXIST in Debian Bookworm!
+        # Pure Debian 32-bit dependencies. No hacks needed.
         apt-get install -y \
           gcc-multilib g++-multilib \
           zlib1g-dev:i386 \
@@ -44,8 +43,6 @@ jobs:
           libssl-dev:i386 \
           libunwind-dev:i386 \
           liblttng-ust-dev:i386 \
-          debootstrap \
-          qemu-user-static \
           binutils \
           libc6-dev-i386 \
           libstdc++-12-dev:i386
@@ -67,8 +64,9 @@ jobs:
     - name: Build x86 Cross-Compilation RootFS
       working-directory: runtime
       run: |
-        # This will now succeed perfectly because liblttng-ust-dev:i386 is actually installed!
-        sudo ./eng/common/cross/build-rootfs.sh x86
+        # THE FIX: Tell the script to build a DEBIAN rootfs, not Ubuntu.
+        # This perfectly matches our container and avoids all keyring issues.
+        sudo ./eng/common/cross/build-rootfs.sh x86 debian
 
     - name: Install and Patch .NET SDK
       working-directory: runtime
