@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Pure Debian)
+name: Build & Test .NET 9 Linux x86 (Pure Debian - Fixed)
 
 on:
   push:
@@ -27,18 +27,19 @@ jobs:
         sudo sysctl -w vm.overcommit_memory=1
         sudo sysctl -w vm.max_map_count=262144
 
-    - name: Install Build Dependencies (Pure Debian)
+    - name: Install Build Dependencies (Pure Debian, FULL install)
       run: |
         apt-get update
-        # Installiere python3 explizit mit --no-install-recommends für Geschwindigkeit und Zuverlässigkeit
-        apt-get install -y --no-install-recommends \
+        # KEIN --no-install-recommends! Wir brauchen eine vollständige, funktionierende Umgebung.
+        # ca-certificates ist entscheidend, damit git HTTPS zu GitHub verifizieren kann.
+        apt-get install -y \
           wget curl python3 python3-minimal git cmake ninja-build ccache \
-          clang file build-essential sudo debootstrap qemu-user-static
+          clang file build-essential sudo debootstrap qemu-user-static ca-certificates
         
         dpkg --add-architecture i386
         apt-get update
         
-        apt-get install -y --no-install-recommends \
+        apt-get install -y \
           gcc-multilib g++-multilib \
           zlib1g-dev:i386 \
           libicu-dev:i386 \
@@ -86,9 +87,6 @@ jobs:
     - name: Install and Patch .NET SDK
       working-directory: runtime
       run: |
-        # Absolute Sicherheit: Stelle sicher, dass python3 wirklich verfügbar ist
-        apt-get update && apt-get install -y --no-install-recommends python3
-        
         SDK_VERSION=$(python3 -c "import json; print(json.load(open('global.json'))['sdk']['version'])")
         echo "Installing .NET SDK $SDK_VERSION (x64)"
         
