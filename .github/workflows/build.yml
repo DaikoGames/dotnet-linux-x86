@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Kernel Limits Fix)
+name: Build & Test .NET 9 Linux x86 (Kernel Overcommit Fix)
 
 on:
   push:
@@ -17,12 +17,19 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    # CRITICAL FIX 1: Increase Linux kernel memory map limit.
-    # GitHub Actions default is 65530, which causes .NET 32-bit to crash with 0x8007000E (ENOMEM).
-    - name: Increase Kernel max_map_count
+    - name: Fix Kernel Memory Overcommit & Limits
       run: |
+        # FIX 1: Erlaube dem Kernel, ALLE virtuellen Speicherreservierungen zu genehmigen.
+        # Dies ist der entscheidende Fix für den .NET GC auf 32-Bit in 64-Bit-Umgebungen.
+        sudo sysctl -w vm.overcommit_memory=1
+        
+        # FIX 2: Erhöhe die maximale Anzahl an Memory-Mappings
         sudo sysctl -w vm.max_map_count=262144
-        echo "vm.max_map_count set to $(sysctl vm.max_map_count)"
+        
+        # FIX 3: Entferne ulimit-Beschränkungen für diesen Runner
+        ulimit -v unlimited
+        ulimit -m unlimited
+        echo "Kernel limits successfully applied."
 
     - name: Checkout .NET 9 Runtime
       uses: actions/checkout@v4
@@ -35,7 +42,7 @@ jobs:
       run: |
         sudo dpkg --add-architecture i386
         sudo apt-get update
-        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libicu74:i386 libssl-dev:i386 libssl3:i386 libunwind-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3 file util-linux
+        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libicu74:i386 libssl-dev:i386 libssl3:i386 libunwind-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3 file
 
     - name: Setup ccache
       run: |
@@ -53,14 +60,11 @@ jobs:
       run: |
         sed -i 's/if(NOT HAVE_LTTNG_TRACEPOINT_H AND FEATURE_EVENT_TRACE)/if(FALSE)/' src/coreclr/pal/src/configure.cmake
         sed -i 's/if(CLR_CMAKE_HOST_LINUX)/if(FALSE) # Always use dummyprovider to avoid LTTng dependency/' src/coreclr/pal/src/eventprovider/CMakeLists.txt
-        echo "Successfully patched CoreCLR to use dummyprovider"
 
     - name: Install and Patch .NET SDK
       working-directory: runtime
       run: |
         SDK_VERSION=$(python3 -c "import json; print(json.load(open('global.json'))['sdk']['version'])")
-        echo "Required SDK version: $SDK_VERSION"
-        
         mkdir -p .dotnet
         wget -q https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
         chmod +x dotnet-install.sh
@@ -69,13 +73,10 @@ jobs:
         python3 -c "
         import json
         path = '.dotnet/sdk/$SDK_VERSION/RuntimeIdentifierGraph.json'
-        with open(path, 'r') as f:
-            data = json.load(f)
+        with open(path, 'r') as f: data = json.load(f)
         if 'linux-x86' not in data['runtimes']:
             data['runtimes']['linux-x86'] = { '#import': ['linux'] }
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2)
-        print('Successfully patched RuntimeIdentifierGraph.json')
+        with open(path, 'w') as f: json.dump(data, f, indent=2)
         "
 
     - name: Build CoreCLR and Libraries
@@ -86,22 +87,12 @@ jobs:
         DOTNET_MULTILEVEL_LOOKUP: 0
       run: |
         ./build.sh -os linux -arch x86 -c Release -subset clr+libs -cross --ninja \
-          /p:UseNinja=true \
-          /p:InvariantGlobalization=false \
-          /p:BuildAppHost=false
+          /p:UseNinja=true /p:InvariantGlobalization=false /p:BuildAppHost=false
 
-    - name: Package Self-Contained Runtime (Strict 32-bit Match)
+    - name: Package Self-Contained Runtime
       run: |
         mkdir -p dotnet-portable-x86
-        
         CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
-        echo "Found CoreCLR dir: $CORECLR_DIR"
-        
-        if [ -z "$CORECLR_DIR" ]; then
-          echo "ERROR: Could not find exact x86 release directory!"
-          find runtime/artifacts/bin/coreclr -type d | head -n 10
-          exit 1
-        fi
         
         cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
         cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
@@ -109,35 +100,38 @@ jobs:
         
         RUNTIME_DLL=$(find runtime/artifacts/bin -type f -name "System.Runtime.dll" | head -n 1)
         if [ -n "$RUNTIME_DLL" ]; then
-          RUNTIME_DIR=$(dirname "$RUNTIME_DLL")
-          echo "Found Runtime dir: $RUNTIME_DIR"
-          cp "$RUNTIME_DIR"/*.dll dotnet-portable-x86/
+          cp "$(dirname "$RUNTIME_DLL")"/*.dll dotnet-portable-x86/
         else
-          echo "ERROR: Could not find System.Runtime.dll!"
-          exit 1
+          echo "ERROR: System.Runtime.dll not found!" && exit 1
         fi
 
-    - name: Diagnostic Architecture Check
+    - name: STRICT Architecture Verification
       run: |
-        echo "=== Architecture of corerun ==="
+        echo "=== Checking corerun architecture ==="
         file dotnet-portable-x86/corerun
-        echo "=== Architecture of libcoreclr.so ==="
-        file dotnet-portable-x86/libcoreclr.so
+        if ! file dotnet-portable-x86/corerun | grep -qi "32-bit"; then
+          echo "FATAL: corerun is NOT 32-bit!" && exit 1
+        fi
+        echo "=== ldd corerun (checking for missing native libs) ==="
+        ldd dotnet-portable-x86/corerun
 
-    - name: Create "Run From Anywhere" Launcher (WITH ALL FIXES)
+    - name: Create "Run From Anywhere" Launcher
       run: |
         cat << 'EOF' > dotnet-portable-x86/run.sh
         #!/bin/bash
         DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
         export DOTNET_ROOT="$DIR"
         
-        # CRITICAL FIX 2: Hard limit GC to 1GB to prevent virtual memory exhaustion
+        # Lokale ulimit-Sicherheit für den Prozess
+        ulimit -v unlimited
+        ulimit -m unlimited
+        
+        # GC auf 1GB begrenzen, um den 32-Bit-Adressraum nicht zu sprengen
         export DOTNET_GCHeapHardLimit=0x40000000
         export DOTNET_TieredCompilation=0
         
-        # CRITICAL FIX 3: Use setarch to disable ASLR (-R) for this 32-bit process.
-        # This prevents the 64-bit kernel from fragmenting the 32-bit address space.
-        exec setarch i686 -R "$DIR/corerun" "$@"
+        # Direkte Ausführung ohne setarch (vermeidet Seccomp-Konflikte in CI)
+        exec "$DIR/corerun" "$@"
         EOF
         chmod +x dotnet-portable-x86/run.sh
 
@@ -147,7 +141,7 @@ jobs:
         chmod +x dotnet-install.sh
         ./dotnet-install.sh --channel 9.0 --install-dir ./dotnet-sdk
 
-    - name: Create IL Stress Test Project
+    - name: Create & Compile IL Stress Test
       run: |
         ./dotnet-sdk/dotnet new console -n IL_Stress_Test -o IL_Stress_Test --framework net9.0
         cat << 'CSHARP' > IL_Stress_Test/Program.cs
@@ -177,25 +171,17 @@ jobs:
             static extern int getpid();
         }
         CSHARP
+        ./dotnet-sdk/dotnet build IL_Stress_Test -c Release
 
-    - name: Compile IL Stress Test
-      working-directory: IL_Stress_Test
-      run: |
-        ../dotnet-sdk/dotnet build -c Release
-
-    - name: Execute IL Stress Test on Custom x86 Runtime
+    - name: Execute IL Stress Test
       run: |
         ./dotnet-portable-x86/run.sh ./IL_Stress_Test/bin/Release/net9.0/IL_Stress_Test.dll
 
-    - name: Zip the Final Abomination
+    - name: Zip and Upload
       if: success()
-      run: |
-        zip -r dotnet9-linux-x86-portable.zip dotnet-portable-x86
-
-    - name: Upload Artifact
+      run: zip -r dotnet9-linux-x86-portable.zip dotnet-portable-x86
+    - uses: actions/upload-artifact@v4
       if: success()
-      uses: actions/upload-artifact@v4
       with:
-        name: dotnet9-linux-x86-selfcontained-tested
+        name: dotnet9-linux-x86-tested
         path: dotnet9-linux-x86-portable.zip
-        retention-days: 7
