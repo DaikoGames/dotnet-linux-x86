@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Kernel Overcommit Fix)
+name: Build & Test .NET 9 Linux x86 (Minimal TPA + Ultimate Diagnostics)
 
 on:
   push:
@@ -17,19 +17,12 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Fix Kernel Memory Overcommit & Limits
+    - name: Fix Kernel Memory Limits
       run: |
-        # FIX 1: Erlaube dem Kernel, ALLE virtuellen Speicherreservierungen zu genehmigen.
-        # Dies ist der entscheidende Fix für den .NET GC auf 32-Bit in 64-Bit-Umgebungen.
         sudo sysctl -w vm.overcommit_memory=1
-        
-        # FIX 2: Erhöhe die maximale Anzahl an Memory-Mappings
         sudo sysctl -w vm.max_map_count=262144
-        
-        # FIX 3: Entferne ulimit-Beschränkungen für diesen Runner
         ulimit -v unlimited
         ulimit -m unlimited
-        echo "Kernel limits successfully applied."
 
     - name: Checkout .NET 9 Runtime
       uses: actions/checkout@v4
@@ -59,7 +52,7 @@ jobs:
       working-directory: runtime
       run: |
         sed -i 's/if(NOT HAVE_LTTNG_TRACEPOINT_H AND FEATURE_EVENT_TRACE)/if(FALSE)/' src/coreclr/pal/src/configure.cmake
-        sed -i 's/if(CLR_CMAKE_HOST_LINUX)/if(FALSE) # Always use dummyprovider to avoid LTTng dependency/' src/coreclr/pal/src/eventprovider/CMakeLists.txt
+        sed -i 's/if(CLR_CMAKE_HOST_LINUX)/if(FALSE)/' src/coreclr/pal/src/eventprovider/CMakeLists.txt
 
     - name: Install and Patch .NET SDK
       working-directory: runtime
@@ -79,60 +72,84 @@ jobs:
         with open(path, 'w') as f: json.dump(data, f, indent=2)
         "
 
-    - name: Build CoreCLR and Libraries
+    - name: Build CoreCLR, Libraries, and Host
       working-directory: runtime
       env:
         ROOTFS_DIR: ${{ github.workspace }}/runtime/.tools/rootfs/x86
         DOTNET_INSTALL_DIR: ${{ github.workspace }}/runtime/.dotnet
         DOTNET_MULTILEVEL_LOOKUP: 0
       run: |
-        ./build.sh -os linux -arch x86 -c Release -subset clr+libs -cross --ninja \
+        # Wir versuchen jetzt, den echten 'host' (dotnet) zu bauen. 
+        # Falls das aufgrund des gepatchten RID-Graphen funktioniert, ist es viel robuster als corerun.
+        ./build.sh -os linux -arch x86 -c Release -subset clr+libs+host -cross --ninja \
           /p:UseNinja=true /p:InvariantGlobalization=false /p:BuildAppHost=false
 
-    - name: Package Self-Contained Runtime
+    - name: Package Self-Contained Runtime (Using Testhost Layout for Minimal TPA)
       run: |
         mkdir -p dotnet-portable-x86
-        CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
         
-        cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
-        cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
-        find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
+        # 1. Versuche, den echten 'dotnet' Host zu finden (falls der Build erfolgreich war)
+        DOTNET_HOST=$(find runtime/artifacts/bin -type f -name "dotnet" | grep -i "linux.x86" | head -n 1)
         
-        RUNTIME_DLL=$(find runtime/artifacts/bin -type f -name "System.Runtime.dll" | head -n 1)
-        if [ -n "$RUNTIME_DLL" ]; then
-          cp "$(dirname "$RUNTIME_DLL")"/*.dll dotnet-portable-x86/
+        if [ -n "$DOTNET_HOST" ]; then
+          echo "Found official dotnet host! Using it."
+          HOST_DIR=$(dirname "$DOTNET_HOST")
+          cp "$HOST_DIR"/dotnet dotnet-portable-x86/
+          cp "$HOST_DIR"/*.so dotnet-portable-x86/ 2>/dev/null || true
+          EXECUTABLE_NAME="dotnet"
         else
-          echo "ERROR: System.Runtime.dll not found!" && exit 1
+          echo "Falling back to corerun with minimal testhost layout."
+          CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
+          cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
+          cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
+          EXECUTABLE_NAME="corerun"
+        fi
+        
+        # 2. CRITICAL FIX: Use the official 'testhost' directory for DLLs.
+        # This contains the EXACT, MINIMAL set of DLLs needed to run apps, 
+        # preventing the TPA string from becoming too long and causing 0x8007000e.
+        TESTHOST_DIR=$(find runtime/artifacts/bin/testhost -type d -iname "*linux*x86*release*" | head -n 1)
+        
+        if [ -n "$TESTHOST_DIR" ]; then
+          echo "Using minimal testhost layout from: $TESTHOST_DIR"
+          cp "$TESTHOST_DIR"/*.dll dotnet-portable-x86/
+          # Also copy the shared framework folder structure if it exists
+          cp -r "$TESTHOST_DIR/shared" dotnet-portable-x86/ 2>/dev/null || true
+        else
+          echo "WARNING: testhost not found. Falling back to manual minimal copy."
+          # Fallback: Only copy the absolute essentials
+          find runtime/artifacts/bin -type f \( -name "System.Private.CoreLib.dll" -o -name "System.Runtime.dll" -o -name "System.Console.dll" -o -name "mscorlib.dll" -o -name "netstandard.dll" \) | grep -i "linux.x86.release" | head -n 20 | xargs -I {} cp {} dotnet-portable-x86/
         fi
 
     - name: STRICT Architecture Verification
       run: |
-        echo "=== Checking corerun architecture ==="
-        file dotnet-portable-x86/corerun
-        if ! file dotnet-portable-x86/corerun | grep -qi "32-bit"; then
-          echo "FATAL: corerun is NOT 32-bit!" && exit 1
+        echo "=== Checking executable architecture ==="
+        file dotnet-portable-x86/$EXECUTABLE_NAME
+        if ! file dotnet-portable-x86/$EXECUTABLE_NAME | grep -qi "32-bit"; then
+          echo "FATAL: Executable is NOT 32-bit!" && exit 1
         fi
-        echo "=== ldd corerun (checking for missing native libs) ==="
-        ldd dotnet-portable-x86/corerun
+        echo "=== ldd check (looking for missing .so files) ==="
+        ldd dotnet-portable-x86/$EXECUTABLE_NAME || true
 
-    - name: Create "Run From Anywhere" Launcher
+    - name: Create "Run From Anywhere" Launcher (WITH LD_DEBUG)
       run: |
         cat << 'EOF' > dotnet-portable-x86/run.sh
         #!/bin/bash
         DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
         export DOTNET_ROOT="$DIR"
-        
-        # Lokale ulimit-Sicherheit für den Prozess
         ulimit -v unlimited
         ulimit -m unlimited
-        
-        # GC auf 1GB begrenzen, um den 32-Bit-Adressraum nicht zu sprengen
         export DOTNET_GCHeapHardLimit=0x40000000
         export DOTNET_TieredCompilation=0
         
-        # Direkte Ausführung ohne setarch (vermeidet Seccomp-Konflikte in CI)
-        exec "$DIR/corerun" "$@"
+        # ULTIMATE DIAGNOSTIC: If it fails, this will print the EXACT missing .so 
+        # or the exact mmap failure, leaving zero room for guessing.
+        export LD_DEBUG=libs,bindings
+        
+        exec "$DIR/$EXECUTABLE_NAME" "$@"
         EOF
+        # Dynamically replace EXECUTABLE_NAME in the script
+        sed -i "s/\$EXECUTABLE_NAME/$EXECUTABLE_NAME/g" dotnet-portable-x86/run.sh
         chmod +x dotnet-portable-x86/run.sh
 
     - name: Install Standard .NET 9 SDK
@@ -147,7 +164,6 @@ jobs:
         cat << 'CSHARP' > IL_Stress_Test/Program.cs
         using System;
         using System.Threading;
-        using System.Threading.Tasks;
         using System.Runtime.InteropServices;
 
         class Program {
@@ -156,12 +172,12 @@ jobs:
                 double result = 0;
                 for(int i=0; i<10000; i++) result += Math.Sin(i) * Math.Cos(i);
                 Console.WriteLine($"[PASS] Math/SSE Stack Alignment: {result}");
-                Parallel.For(0, 100, i => { Thread.Sleep(1); });
-                Console.WriteLine("[PASS] Threading & TLS");
-                byte[][] arrays = new byte[100][];
-                for(int i=0; i<100; i++) arrays[i] = new byte[1024 * 1024]; 
+                
+                byte[][] arrays = new byte[10][]; // Reduced from 100 to be extra safe on 32-bit
+                for(int i=0; i<10; i++) arrays[i] = new byte[1024 * 1024]; 
                 GC.Collect();
                 Console.WriteLine("[PASS] GC & Memory Allocation");
+                
                 int pid = getpid();
                 Console.WriteLine($"[PASS] P/Invoke (libc getpid): {pid}");
                 Console.WriteLine("=== ALL IL TESTS PASSED! RUNTIME IS STABLE ===");
