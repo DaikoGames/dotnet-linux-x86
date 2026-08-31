@@ -30,12 +30,15 @@ jobs:
     - name: Install Build Dependencies (Pure Debian)
       run: |
         apt-get update
-        apt-get install -y wget curl python3 git cmake ninja-build ccache clang file build-essential sudo debootstrap qemu-user-static
+        # Installiere python3 explizit mit --no-install-recommends für Geschwindigkeit und Zuverlässigkeit
+        apt-get install -y --no-install-recommends \
+          wget curl python3 python3-minimal git cmake ninja-build ccache \
+          clang file build-essential sudo debootstrap qemu-user-static
         
         dpkg --add-architecture i386
         apt-get update
         
-        apt-get install -y \
+        apt-get install -y --no-install-recommends \
           gcc-multilib g++-multilib \
           zlib1g-dev:i386 \
           libicu-dev:i386 \
@@ -69,7 +72,7 @@ jobs:
         # Patch 2: Remove 'universe' (Ubuntu-only component)
         sed -i 's/Components: main universe/Components: main/g' eng/common/cross/build-rootfs.sh
         
-        # Patch 3: Remove 'security' suite (Debian security is on a separate repo, updates/backports is enough for build deps)
+        # Patch 3: Remove 'security' suite (Debian security is on a separate repo)
         sed -i 's/__UbuntuSuites="updates security backports"/__UbuntuSuites="updates backports"/g' eng/common/cross/build-rootfs.sh
         
         # Patch 4: Use Debian's libunwind-dev instead of Ubuntu's libunwind8-dev
@@ -83,6 +86,9 @@ jobs:
     - name: Install and Patch .NET SDK
       working-directory: runtime
       run: |
+        # Absolute Sicherheit: Stelle sicher, dass python3 wirklich verfügbar ist
+        apt-get update && apt-get install -y --no-install-recommends python3
+        
         SDK_VERSION=$(python3 -c "import json; print(json.load(open('global.json'))['sdk']['version'])")
         echo "Installing .NET SDK $SDK_VERSION (x64)"
         
