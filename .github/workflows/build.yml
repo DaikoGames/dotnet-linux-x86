@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Ultimate Speed + Complete TPA Fix)
+name: Build & Test .NET 9 Linux x86 (Final Corrected)
 
 on:
   push:
@@ -40,11 +40,8 @@ jobs:
     - name: Setup ccache for MAXIMUM SPEED
       run: |
         echo "/usr/lib/ccache" >> $GITHUB_PATH
-        # Maximale Cache-Größe für schnelle Re-Builds
         ccache -M 5.0G
-        # Maximale Kompression spart I/O-Zeit auf dem Runner
         ccache -o compression_level=9
-        # Statistiken zurücksetzen
         ccache -z
 
     - name: Build x86 Cross-Compilation RootFS
@@ -83,30 +80,39 @@ jobs:
         DOTNET_INSTALL_DIR: ${{ github.workspace }}/runtime/.dotnet
         DOTNET_MULTILEVEL_LOOKUP: 0
       run: |
-        # /m und BuildInParallel=true zwingen MSBuild, alle CPU-Kerne zu nutzen
+        # --ninja aktiviert automatisch maximale CPU-Kern-Nutzung. 
+        # /m und BuildInParallel=true tun dasselbe für MSBuild. Kein -j Flag nötig!
         ./build.sh -os linux -arch x86 -c Release -subset clr+libs -cross --ninja \
-          /p:UseNinja=true /p:InvariantGlobalization=false /p:BuildAppHost=false \
-          /p:BuildInParallel=true /m
+          /p:UseNinja=true \
+          /p:InvariantGlobalization=false \
+          /p:BuildAppHost=false \
+          /p:BuildInParallel=true \
+          /m
 
-    - name: Package Self-Contained Runtime (COMBINE CoreCLR + BCL)
+    - name: Package Self-Contained Runtime (BULLETPROOF)
       run: |
         mkdir -p dotnet-portable-x86
         
         # 1. Copy CoreCLR native binaries & System.Private.CoreLib.dll
         CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
         echo "Found CoreCLR dir: $CORECLR_DIR"
+        
+        if [ -z "$CORECLR_DIR" ]; then
+          echo "FATAL ERROR: CoreCLR build output not found!"
+          exit 1
+        fi
+        
         cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
         cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
         find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
         
-        # 2. CRITICAL FIX: Copy the Base Class Library (BCL) DLLs from the libs output
-        # Removed the strict grep filter because the folder name is net9.0-linux-Release-x86
+        # 2. Copy the Base Class Library (BCL) DLLs from the libs output
+        # KEIN grep-Filter mehr! Findet einfach die erste System.Runtime.dll
         RUNTIME_DLL=$(find runtime/artifacts/bin/runtime -type f -name "System.Runtime.dll" | head -n 1)
         
         if [ -n "$RUNTIME_DLL" ]; then
           BCL_DIR=$(dirname "$RUNTIME_DLL")
           echo "Found BCL dir: $BCL_DIR"
-          # Copy ALL top-level BCL DLLs
           cp "$BCL_DIR"/*.dll dotnet-portable-x86/
         else
           echo "FATAL ERROR: Could not find System.Runtime.dll in libs output!"
