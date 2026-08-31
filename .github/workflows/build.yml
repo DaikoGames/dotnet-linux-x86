@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Pure Debian - Strict TPA Fix)
+name: Build & Test .NET 9 Linux x86 (Pure Debian - Testhost Fix)
 
 on:
   push:
@@ -111,7 +111,7 @@ jobs:
       run: |
         ./build.sh clr+libs -c Release -arch x86 -cross --ninja
 
-    - name: Package Self-Contained Runtime (STRICT LINUX-X86 ONLY)
+    - name: Package Self-Contained Runtime (OFFICIAL TESTHOST MINIMAL)
       run: |
         mkdir -p dotnet-portable-x86
         
@@ -125,31 +125,36 @@ jobs:
         
         cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
         cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
-        find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
         
-        # KORRIGIERT: Suche nach der Datei, nicht nach dem Ordnernamen, da der Ordner "net9.0-linux-Release-x86" heißt
-        RUNTIME_DLL=$(find runtime/artifacts/bin/runtime -type f -name "System.Runtime.dll" | head -n 1)
+        # CRITICAL FIX: Use the official 'testhost' directory.
+        # This directory is specifically built by the 'libs' subset to contain 
+        # the EXACT, MINIMAL set of DLLs required for corerun to work, 
+        # without any Windows compatibility shims or bloat.
+        TESTHOST_DIR=$(find runtime/artifacts/bin/testhost -type d \( -name "net9.0-linux-Release-x86" -o -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
         
-        if [ -n "$RUNTIME_DLL" ]; then
-          RUNTIME_DIR=$(dirname "$RUNTIME_DLL")
-          echo "Found Runtime dir: $RUNTIME_DIR"
-          
-          # Copy DLLs, but actively skip known Windows-only assemblies
-          for dll in "$RUNTIME_DIR"/*.dll; do
-            basename_dll=$(basename "$dll")
-            case "$basename_dll" in
-              System.Windows.dll|WindowsBase.dll|System.Web.dll|System.Drawing.dll|System.Data.SqlClient.dll|System.Data.OleDb.dll|System.Data.Odbc.dll|System.Management.dll|System.ServiceProcess*.dll|Microsoft.Win32*.dll|System.DirectoryServices*.dll|System.Speech.dll)
-                echo "Skipping Windows-specific DLL: $basename_dll"
-                ;;
-              *)
-                cp "$dll" dotnet-portable-x86/
-                ;;
-            esac
-          done
+        if [ -n "$TESTHOST_DIR" ] && [ -d "$TESTHOST_DIR" ]; then
+          echo "Found official Testhost dir: $TESTHOST_DIR"
+          cp "$TESTHOST_DIR"/*.dll dotnet-portable-x86/
         else
-          echo "FATAL ERROR: Could not find System.Runtime.dll!"
-          find runtime/artifacts/bin/runtime -type d | head -n 20
-          exit 1
+          echo "WARNING: Testhost dir not found, falling back to strict runtime filtering."
+          RUNTIME_DLL=$(find runtime/artifacts/bin/runtime -type f -name "System.Runtime.dll" | head -n 1)
+          if [ -n "$RUNTIME_DLL" ]; then
+            RUNTIME_DIR=$(dirname "$RUNTIME_DLL")
+            for dll in "$RUNTIME_DIR"/*.dll; do
+              basename_dll=$(basename "$dll")
+              case "$basename_dll" in
+                System.Windows.dll|WindowsBase.dll|System.Web.dll|System.Drawing.dll|System.Data.SqlClient.dll|System.Data.OleDb.dll|System.Data.Odbc.dll|System.Management.dll|System.ServiceProcess*.dll|Microsoft.Win32*.dll|System.DirectoryServices*.dll|System.Speech.dll|System.Windows.Extensions.dll|Microsoft.VisualBasic.dll|System.ServiceModel.Web.dll|System.Data.dll|System.Web.HttpUtility.dll|System.Drawing.Primitives.dll)
+                  echo "Skipping bloat DLL: $basename_dll"
+                  ;;
+                *)
+                  cp "$dll" dotnet-portable-x86/
+                  ;;
+              esac
+            done
+          else
+            echo "FATAL ERROR: Could not find System.Runtime.dll!"
+            exit 1
+          fi
         fi
         
         echo "Packaged DLL count: $(ls -1 dotnet-portable-x86/*.dll | wc -l)"
