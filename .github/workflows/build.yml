@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Pure Debian - Final Whitelist Fix)
+name: Build & Test .NET 9 Linux x86 (Pure Debian - Final GC Fix)
 
 on:
   push:
@@ -122,9 +122,7 @@ jobs:
         cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
         find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
         
-        # 2. Managed DLLs: STRENGE WHITELIST
-        # Wir kopieren NUR das, was für eine Basis-Konsolenapp absolut notwendig ist.
-        # Das hält die TPA-Liste winzig und verhindert den 32-Bit OOM (0x8007000e).
+        # 2. Managed DLLs: STRENGE WHITELIST (erweitert um Globalization/Encoding)
         RUNTIME_DIR=$(find runtime/artifacts/bin/runtime -type d -name "net9.0-linux-Release-x86" | head -n 1)
         echo "Found Runtime dir: $RUNTIME_DIR"
         
@@ -141,7 +139,10 @@ jobs:
         System.IO.dll
         System.IO.FileSystem.dll
         System.Text.RegularExpressions.dll
+        System.Text.Encoding.dll
+        System.Text.Encoding.Extensions.dll
         System.Runtime.InteropServices.dll
+        System.Runtime.Extensions.dll
         System.Memory.dll
         System.Buffers.dll
         System.Numerics.dll
@@ -149,6 +150,12 @@ jobs:
         System.Diagnostics.Debug.dll
         System.ComponentModel.dll
         System.ComponentModel.Primitives.dll
+        System.Globalization.dll
+        System.Globalization.Extensions.dll
+        System.Reflection.dll
+        System.Reflection.Primitives.dll
+        System.Resources.ResourceManager.dll
+        System.Private.Uri.dll
         netstandard.dll
         mscorlib.dll
         System.dll
@@ -158,15 +165,10 @@ jobs:
         for dll in $WHITELIST; do
           if [ -f "$RUNTIME_DIR/$dll" ]; then
             cp "$RUNTIME_DIR/$dll" dotnet-portable-x86/
-            echo "Copied: $dll"
-          else
-            echo "Warning: $dll not found in $RUNTIME_DIR (skipping)"
           fi
         done
         
-        echo "========================================="
         echo "FINAL Packaged DLL count: $(ls -1 dotnet-portable-x86/*.dll | wc -l)"
-        echo "========================================="
 
     - name: STRICT Architecture Verification
       run: |
@@ -178,7 +180,7 @@ jobs:
         echo "=== ldd check ==="
         LD_LIBRARY_PATH="$(pwd)/dotnet-portable-x86" ldd dotnet-portable-x86/corerun || true
 
-    - name: Create "Run From Anywhere" Launcher (WITH ASLR FIX)
+    - name: Create "Run From Anywhere" Launcher (WITH SERVER GC FIX)
       run: |
         cat << 'EOF' > dotnet-portable-x86/run.sh
         #!/bin/bash
@@ -187,10 +189,16 @@ jobs:
         export LD_LIBRARY_PATH="$DIR:$LD_LIBRARY_PATH"
         ulimit -v unlimited
         ulimit -m unlimited
-        export DOTNET_GCHeapHardLimit=0x40000000
+        
+        # CRITICAL FIX: Disable Server GC. The Server GC tries to allocate a massive heap 
+        # for EVERY CPU core, which instantly causes OOM (0x8007000e) on 32-bit systems.
+        export DOTNET_gcServer=0
+        
+        # Limit the heap to 128 MB to fit safely in the 32-bit address space
+        export DOTNET_GCHeapHardLimit=0x8000000
         export DOTNET_TieredCompilation=0
         
-        # CRITICAL: Disable ASLR (-R) to prevent 32-bit virtual memory fragmentation
+        # Disable ASLR (-R) to prevent virtual memory fragmentation
         exec setarch i686 -R "$DIR/corerun" "$@"
         EOF
         chmod +x dotnet-portable-x86/run.sh
