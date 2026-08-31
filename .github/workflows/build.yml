@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Complete TPA Fix)
+name: Build & Test .NET 9 Linux x86 (Complete TPA Fix + MAX SPEED)
 
 on:
   push:
@@ -37,11 +37,16 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libicu74:i386 libssl-dev:i386 libssl3:i386 libunwind-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3 file
 
-    - name: Setup ccache
+    - name: Setup ccache for MAXIMUM SPEED
       run: |
         echo "/usr/lib/ccache" >> $GITHUB_PATH
-        ccache -M 2.0G
+        # Maximale Cache-Größe für schnelle Re-Builds
+        ccache -M 5.0G
+        # Maximale Kompression spart I/O-Zeit
+        ccache -o compression_level=9
+        # Statistiken zurücksetzen
         ccache -z
+        echo "ccache configured for maximum performance"
 
     - name: Build x86 Cross-Compilation RootFS
       working-directory: runtime
@@ -72,15 +77,21 @@ jobs:
         with open(path, 'w') as f: json.dump(data, f, indent=2)
         "
 
-    - name: Build CoreCLR and Libraries
+    - name: Build CoreCLR and Libraries (MAXIMUM PARALLELISM)
       working-directory: runtime
       env:
         ROOTFS_DIR: ${{ github.workspace }}/runtime/.tools/rootfs/x86
         DOTNET_INSTALL_DIR: ${{ github.workspace }}/runtime/.dotnet
         DOTNET_MULTILEVEL_LOOKUP: 0
       run: |
+        # Maximale Parallelität für Ninja und MSBuild
         ./build.sh -os linux -arch x86 -c Release -subset clr+libs -cross --ninja \
-          /p:UseNinja=true /p:InvariantGlobalization=false /p:BuildAppHost=false
+          /p:UseNinja=true \
+          /p:InvariantGlobalization=false \
+          /p:BuildAppHost=false \
+          /p:BuildInParallel=true \
+          /m \
+          -j $(nproc)
 
     - name: Package Self-Contained Runtime (COMBINE CoreCLR + BCL)
       run: |
@@ -94,8 +105,8 @@ jobs:
         find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
         
         # 2. CRITICAL FIX: Copy the Base Class Library (BCL) DLLs from the libs output
-        # This is where System.Runtime.dll, System.Console.dll, etc. actually live!
-        RUNTIME_DLL=$(find runtime/artifacts/bin/runtime -type f -name "System.Runtime.dll" | grep -i "linux.x86" | head -n 1)
+        # Removed the strict grep filter because the folder name is net9.0-linux-Release-x86
+        RUNTIME_DLL=$(find runtime/artifacts/bin/runtime -type f -name "System.Runtime.dll" | head -n 1)
         
         if [ -n "$RUNTIME_DLL" ]; then
           BCL_DIR=$(dirname "$RUNTIME_DLL")
