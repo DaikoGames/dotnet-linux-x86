@@ -64,12 +64,18 @@ jobs:
     - name: Build x86 Cross-Compilation RootFS (Pure Debian)
       working-directory: runtime
       run: |
-        # Fix 1: The script hardcodes the Ubuntu repo for 'x86'. We change it to Debian.
-        sed -i '/x86)/, /;;/ s|__UbuntuRepo="http://archive.ubuntu.com/ubuntu/"|__UbuntuRepo="http://ftp.debian.org/debian/"|' eng/common/cross/build-rootfs.sh
+        # Patch 1: Force Debian repo for x86 instead of Ubuntu
+        sed -i '/^[[:space:]]*x86)/,/;;/ s|__UbuntuRepo="http://archive.ubuntu.com/ubuntu/"|__UbuntuRepo="http://deb.debian.org/debian/"|' eng/common/cross/build-rootfs.sh
         
-        # Fix 2: Debian uses 'libunwind-dev', not Ubuntu's 'libunwind8-dev'
+        # Patch 2: Remove 'universe' (Ubuntu-only) from components
+        sed -i 's/Components: main universe/Components: main/' eng/common/cross/build-rootfs.sh
+        
+        # Patch 3: Remove 'security' suite (Debian security is on a different repo, updates/backports is sufficient for build deps)
+        sed -i 's/__UbuntuSuites="updates security backports"/__UbuntuSuites="updates backports"/' eng/common/cross/build-rootfs.sh
+        
+        # Patch 4: Use Debian's libunwind-dev instead of Ubuntu's libunwind8-dev
         sed -i 's/libunwind8-dev/libunwind-dev/g' eng/common/cross/build-rootfs.sh
-        
+
         # Now run it with 'bookworm'. It will use pure Debian i386 packages natively!
         sudo ./eng/common/cross/build-rootfs.sh x86 bookworm
 
