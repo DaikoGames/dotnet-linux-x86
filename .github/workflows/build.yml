@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Pure Debian - Final Fix)
+name: Build & Test .NET 9 Linux x86 (Pure Debian - Ultimate Fix)
 
 on:
   push:
@@ -111,7 +111,7 @@ jobs:
       run: |
         ./build.sh clr+libs -c Release -arch x86 -cross --ninja
 
-    - name: Package Self-Contained Runtime (BULLETPROOF BASH & TPA)
+    - name: Package Self-Contained Runtime (BULLETPROOF)
       run: |
         mkdir -p dotnet-portable-x86
         
@@ -120,29 +120,30 @@ jobs:
         echo "Found CoreCLR dir: $CORECLR_DIR"
         cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
         cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
+        find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
         
-        # 2. Managed DLLs aus dem Ordner, von dem wir wissen, dass er sie hat
+        # 2. Managed DLLs: Erst ALLES kopieren, dann gezielt den Müll löschen.
+        # Das ist 100x sicherer als eine komplexe Bash-for-Schleife.
         RUNTIME_DIR=$(find runtime/artifacts/bin/runtime -type d -name "net9.0-linux-Release-x86" | head -n 1)
         echo "Found Runtime dir: $RUNTIME_DIR"
+        cp "$RUNTIME_DIR"/*.dll dotnet-portable-x86/
         
-        # Massive Blacklist & Bash-Crash-Prevention
-        for dll in "$RUNTIME_DIR"/*.dll; do
-          # WICHTIG: Verhindert den Crash, wenn das Verzeichnis leer ist
-          [ -e "$dll" ] || continue 
-          
-          basename_dll=$(basename "$dll")
-          case "$basename_dll" in
-            Microsoft.*|System.Windows.*|System.Web.*|System.Data.*|System.Drawing.*|System.ServiceProcess.*|System.DirectoryServices.*|System.Speech.*|System.ServiceModel.*)
-              echo "Skipping bloat DLL: $basename_dll"
-              ;;
-            *)
-              cp "$dll" dotnet-portable-x86/
-              ;;
-          esac
-        done
-        
-        # 3. System.Private.CoreLib sicherheitshalber aus dem CoreCLR Ordner holen
-        find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
+        # 3. Aggressives Aufräumen von Windows/Bloat-DLLs, die den 32-Bit TPA Parser sprengen
+        rm -f dotnet-portable-x86/System.Windows*.dll
+        rm -f dotnet-portable-x86/WindowsBase.dll
+        rm -f dotnet-portable-x86/System.Web*.dll
+        rm -f dotnet-portable-x86/System.Drawing*.dll
+        rm -f dotnet-portable-x86/System.Data*.dll
+        rm -f dotnet-portable-x86/System.Management.dll
+        rm -f dotnet-portable-x86/System.ServiceProcess*.dll
+        rm -f dotnet-portable-x86/Microsoft.Win32*.dll
+        rm -f dotnet-portable-x86/System.DirectoryServices*.dll
+        rm -f dotnet-portable-x86/System.Speech.dll
+        rm -f dotnet-portable-x86/System.ServiceModel*.dll
+        rm -f dotnet-portable-x86/System.CodeDom.dll
+        rm -f dotnet-portable-x86/System.Security.Permissions.dll
+        rm -f dotnet-portable-x86/System.Reflection.MetadataLoadContext.dll
+        rm -f dotnet-portable-x86/Microsoft.VisualBasic.dll
         
         echo "Packaged DLL count: $(ls -1 dotnet-portable-x86/*.dll | wc -l)"
 
@@ -156,16 +157,24 @@ jobs:
         echo "=== ldd check ==="
         LD_LIBRARY_PATH="$(pwd)/dotnet-portable-x86" ldd dotnet-portable-x86/corerun || true
 
-    - name: Create "Run From Anywhere" Launcher
+    - name: Create "Run From Anywhere" Launcher (WITH ASLR FIX & DEBUG)
       run: |
         cat << 'EOF' > dotnet-portable-x86/run.sh
         #!/bin/bash
         DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
         export DOTNET_ROOT="$DIR"
         export LD_LIBRARY_PATH="$DIR:$LD_LIBRARY_PATH"
+        ulimit -v unlimited
+        ulimit -m unlimited
         export DOTNET_GCHeapHardLimit=0x40000000
         export DOTNET_TieredCompilation=0
-        exec "$DIR/corerun" "$@"
+        
+        # CRITICAL FIX 1: Disable ASLR (-R) to prevent 32-bit virtual memory fragmentation
+        # on 64-bit kernels, which is the #1 cause of 0x8007000E (ENOMEM) during GC init.
+        # CRITICAL FIX 2: LD_DEBUG tells us the EXACT truth if it still fails.
+        export LD_DEBUG=libs,bindings
+        
+        exec setarch i686 -R "$DIR/corerun" "$@"
         EOF
         chmod +x dotnet-portable-x86/run.sh
 
