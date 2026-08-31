@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Minimal TPA + Ultimate Diagnostics)
+name: Build & Test .NET 9 Linux x86 (Targeted TPA Fix)
 
 on:
   push:
@@ -63,75 +63,68 @@ jobs:
         chmod +x dotnet-install.sh
         ./dotnet-install.sh --version $SDK_VERSION --install-dir .dotnet
         
+        # FIX: Correctly import BOTH 'linux' and 'x86' to satisfy strict SDK validation
         python3 -c "
         import json
         path = '.dotnet/sdk/$SDK_VERSION/RuntimeIdentifierGraph.json'
         with open(path, 'r') as f: data = json.load(f)
         if 'linux-x86' not in data['runtimes']:
-            data['runtimes']['linux-x86'] = { '#import': ['linux'] }
+            data['runtimes']['linux-x86'] = { '#import': ['linux', 'x86'] }
         with open(path, 'w') as f: json.dump(data, f, indent=2)
         "
 
-    - name: Build CoreCLR, Libraries, and Host
+    - name: Build CoreCLR and Libraries (NO HOST)
       working-directory: runtime
       env:
         ROOTFS_DIR: ${{ github.workspace }}/runtime/.tools/rootfs/x86
         DOTNET_INSTALL_DIR: ${{ github.workspace }}/runtime/.dotnet
         DOTNET_MULTILEVEL_LOOKUP: 0
       run: |
-        # Wir versuchen jetzt, den echten 'host' (dotnet) zu bauen. 
-        # Falls das aufgrund des gepatchten RID-Graphen funktioniert, ist es viel robuster als corerun.
-        ./build.sh -os linux -arch x86 -c Release -subset clr+libs+host -cross --ninja \
+        # We stick to clr+libs. This successfully builds corerun and the BCL.
+        # Building 'host' triggers hardcoded SDK checks that are a losing battle.
+        ./build.sh -os linux -arch x86 -c Release -subset clr+libs -cross --ninja \
           /p:UseNinja=true /p:InvariantGlobalization=false /p:BuildAppHost=false
 
-    - name: Package Self-Contained Runtime (Using Testhost Layout for Minimal TPA)
+    - name: Package Self-Contained Runtime (Targeted Shared Framework)
       run: |
         mkdir -p dotnet-portable-x86
         
-        # 1. Versuche, den echten 'dotnet' Host zu finden (falls der Build erfolgreich war)
-        DOTNET_HOST=$(find runtime/artifacts/bin -type f -name "dotnet" | grep -i "linux.x86" | head -n 1)
+        # 1. Copy native CoreCLR binaries
+        CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
+        echo "Found CoreCLR dir: $CORECLR_DIR"
+        cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
+        cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
         
-        if [ -n "$DOTNET_HOST" ]; then
-          echo "Found official dotnet host! Using it."
-          HOST_DIR=$(dirname "$DOTNET_HOST")
-          cp "$HOST_DIR"/dotnet dotnet-portable-x86/
-          cp "$HOST_DIR"/*.so dotnet-portable-x86/ 2>/dev/null || true
-          EXECUTABLE_NAME="dotnet"
+        # 2. CRITICAL FIX: Find the EXACT directory containing the x86 Shared Framework
+        # This prevents copying desktop bloat (System.Windows.dll, etc.) that causes 
+        # the 32-bit TPA parser to overflow and throw 0x8007000e.
+        CORELIB_PATH=$(find runtime/artifacts/bin -type f -name "System.Private.CoreLib.dll" | grep -i "linux.x86.release" | head -n 1)
+        
+        if [ -n "$CORELIB_PATH" ]; then
+          CORELIB_DIR=$(dirname "$CORELIB_PATH")
+          echo "Found pure Shared Framework dir: $CORELIB_DIR"
+          
+          # Copy ONLY the DLLs from this specific, minimal shared framework directory
+          cp "$CORELIB_DIR"/*.dll dotnet-portable-x86/
         else
-          echo "Falling back to corerun with minimal testhost layout."
-          CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
-          cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
-          cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
-          EXECUTABLE_NAME="corerun"
+          echo "FATAL ERROR: Could not find System.Private.CoreLib.dll for linux.x86.release!"
+          find runtime/artifacts/bin -name "System.Private.CoreLib.dll" | head -n 10
+          exit 1
         fi
         
-        # 2. CRITICAL FIX: Use the official 'testhost' directory for DLLs.
-        # This contains the EXACT, MINIMAL set of DLLs needed to run apps, 
-        # preventing the TPA string from becoming too long and causing 0x8007000e.
-        TESTHOST_DIR=$(find runtime/artifacts/bin/testhost -type d -iname "*linux*x86*release*" | head -n 1)
-        
-        if [ -n "$TESTHOST_DIR" ]; then
-          echo "Using minimal testhost layout from: $TESTHOST_DIR"
-          cp "$TESTHOST_DIR"/*.dll dotnet-portable-x86/
-          # Also copy the shared framework folder structure if it exists
-          cp -r "$TESTHOST_DIR/shared" dotnet-portable-x86/ 2>/dev/null || true
-        else
-          echo "WARNING: testhost not found. Falling back to manual minimal copy."
-          # Fallback: Only copy the absolute essentials
-          find runtime/artifacts/bin -type f \( -name "System.Private.CoreLib.dll" -o -name "System.Runtime.dll" -o -name "System.Console.dll" -o -name "mscorlib.dll" -o -name "netstandard.dll" \) | grep -i "linux.x86.release" | head -n 20 | xargs -I {} cp {} dotnet-portable-x86/
-        fi
+        echo "Packaged DLL count: $(ls -1 dotnet-portable-x86/*.dll | wc -l)"
 
     - name: STRICT Architecture Verification
       run: |
-        echo "=== Checking executable architecture ==="
-        file dotnet-portable-x86/$EXECUTABLE_NAME
-        if ! file dotnet-portable-x86/$EXECUTABLE_NAME | grep -qi "32-bit"; then
-          echo "FATAL: Executable is NOT 32-bit!" && exit 1
+        echo "=== Checking corerun architecture ==="
+        file dotnet-portable-x86/corerun
+        if ! file dotnet-portable-x86/corerun | grep -qi "32-bit"; then
+          echo "FATAL: corerun is NOT 32-bit!" && exit 1
         fi
         echo "=== ldd check (looking for missing .so files) ==="
-        ldd dotnet-portable-x86/$EXECUTABLE_NAME || true
+        ldd dotnet-portable-x86/corerun || true
 
-    - name: Create "Run From Anywhere" Launcher (WITH LD_DEBUG)
+    - name: Create "Run From Anywhere" Launcher
       run: |
         cat << 'EOF' > dotnet-portable-x86/run.sh
         #!/bin/bash
@@ -142,14 +135,12 @@ jobs:
         export DOTNET_GCHeapHardLimit=0x40000000
         export DOTNET_TieredCompilation=0
         
-        # ULTIMATE DIAGNOSTIC: If it fails, this will print the EXACT missing .so 
-        # or the exact mmap failure, leaving zero room for guessing.
-        export LD_DEBUG=libs,bindings
+        # Ultimate diagnostic: prints exact missing .so or mmap failure
+        export LD_DEBUG=libs
+        export CORECLR_TRACE=1
         
-        exec "$DIR/$EXECUTABLE_NAME" "$@"
+        exec "$DIR/corerun" "$@"
         EOF
-        # Dynamically replace EXECUTABLE_NAME in the script
-        sed -i "s/\$EXECUTABLE_NAME/$EXECUTABLE_NAME/g" dotnet-portable-x86/run.sh
         chmod +x dotnet-portable-x86/run.sh
 
     - name: Install Standard .NET 9 SDK
@@ -173,7 +164,8 @@ jobs:
                 for(int i=0; i<10000; i++) result += Math.Sin(i) * Math.Cos(i);
                 Console.WriteLine($"[PASS] Math/SSE Stack Alignment: {result}");
                 
-                byte[][] arrays = new byte[10][]; // Reduced from 100 to be extra safe on 32-bit
+                // Reduced memory allocation to be extra safe on 32-bit
+                byte[][] arrays = new byte[10][];
                 for(int i=0; i<10; i++) arrays[i] = new byte[1024 * 1024]; 
                 GC.Collect();
                 Console.WriteLine("[PASS] GC & Memory Allocation");
