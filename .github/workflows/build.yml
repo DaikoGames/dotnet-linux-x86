@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Pure Debian - The Simple Way)
+name: Build & Test .NET 9 Linux x86 (The Simple Way)
 
 on:
   push:
@@ -27,15 +27,16 @@ jobs:
         sudo sysctl -w vm.overcommit_memory=1
         sudo sysctl -w vm.max_map_count=262144
 
-    - name: Install Build Dependencies (Native x64 + i386 Cross)
+    - name: Install Build Dependencies
       run: |
         apt-get update
-        apt-get install -y wget curl python3 git cmake ninja-build ccache clang file build-essential sudo debootstrap qemu-user-static
+        # Install ubuntu-keyring so debootstrap can verify Ubuntu 22.04 (Jammy) packages
+        apt-get install -y wget curl python3 git cmake ninja-build ccache clang file build-essential sudo debootstrap qemu-user-static ubuntu-keyring
         
         dpkg --add-architecture i386
         apt-get update
         
-        # Pure Debian 32-bit dependencies. No hacks needed.
+        # Ubuntu 22.04 (Jammy) still has full, official 32-bit support!
         apt-get install -y \
           gcc-multilib g++-multilib \
           zlib1g-dev:i386 \
@@ -64,9 +65,9 @@ jobs:
     - name: Build x86 Cross-Compilation RootFS
       working-directory: runtime
       run: |
-        # THE FIX: Tell the script to build a DEBIAN rootfs, not Ubuntu.
-        # This perfectly matches our container and avoids all keyring issues.
-        sudo ./eng/common/cross/build-rootfs.sh x86 debian
+        # Use 'jammy' (Ubuntu 22.04). It has all the 32-bit packages we need, 
+        # and the ubuntu-keyring package we installed will allow debootstrap to verify it.
+        sudo ./eng/common/cross/build-rootfs.sh x86 jammy
 
     - name: Install and Patch .NET SDK
       working-directory: runtime
