@@ -1,28 +1,65 @@
-name: Build & Test .NET 9 Linux x86 (Final Corrected)
+name: Build & Test .NET 9 Linux x86 (Debian Bookworm - The Right Way)
 
 on:
   push:
     branches: [ "main" ]
   workflow_dispatch:
 
-env:
-  UseNinja: true
-  CMAKE_GENERATOR: Ninja
-  CFLAGS: "-mstackrealign -fPIC"
-  CXXFLAGS: "-mstackrealign -fPIC -ftls-model=global-dynamic"
-  LDFLAGS: "-Wl,-z,noexecstack"
-
 jobs:
   build-and-test-linux-x86:
+    # Use Debian 12 (Bookworm). It has full, official i386 support, unlike Ubuntu 24.04.
     runs-on: ubuntu-latest
-    
+    container:
+      image: debian:bookworm
+      options: --privileged
+
+    env:
+      UseNinja: true
+      CMAKE_GENERATOR: Ninja
+      CFLAGS: "-mstackrealign -fPIC"
+      CXXFLAGS: "-mstackrealign -fPIC -ftls-model=global-dynamic"
+      LDFLAGS: "-Wl,-z,noexecstack"
+      DEBIAN_FRONTEND: noninteractive
+
     steps:
-    - name: Fix Kernel Memory Limits
+    - name: Fix Kernel Memory Limits (Host)
       run: |
+        # We need sudo for this, so we install it first
+        apt-get update && apt-get install -y sudo
         sudo sysctl -w vm.overcommit_memory=1
         sudo sysctl -w vm.max_map_count=262144
-        ulimit -v unlimited
-        ulimit -m unlimited
+
+    - name: Install Build Dependencies (Native x64 + i386 Cross)
+      run: |
+        apt-get update
+        # Install base build tools first
+        apt-get install -y wget curl python3 git cmake ninja-build ccache clang file build-essential sudo
+        
+        # Enable 32-bit architecture
+        dpkg --add-architecture i386
+        apt-get update
+        
+        # Install 32-bit dependencies. 
+        # NOTE: These ACTUALLY EXIST in Debian Bookworm, unlike Ubuntu 24.04!
+        apt-get install -y \
+          gcc-multilib g++-multilib \
+          zlib1g-dev:i386 \
+          libicu-dev:i386 \
+          libssl-dev:i386 \
+          libunwind-dev:i386 \
+          liblttng-ust-dev:i386 \
+          debootstrap \
+          qemu-user-static \
+          binutils \
+          libc6-dev-i386 \
+          libstdc++-12-dev:i386
+
+    - name: Setup ccache for Maximum Speed
+      run: |
+        echo "/usr/lib/ccache" >> $GITHUB_PATH
+        ccache -M 5.0G
+        ccache -o compression_level=9
+        ccache -z
 
     - name: Checkout .NET 9 Runtime
       uses: actions/checkout@v4
@@ -31,39 +68,26 @@ jobs:
         ref: release/9.0
         path: runtime
 
-    - name: Install System Dependencies
-      run: |
-        sudo dpkg --add-architecture i386
-        sudo apt-get update
-        sudo apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libicu74:i386 libssl-dev:i386 libssl3:i386 libunwind-dev:i386 debootstrap qemu-user-static binutils libc6:i386 libstdc++6:i386 libgcc-s1:i386 cmake ninja-build ccache clang python3 file
-
-    - name: Setup ccache for MAXIMUM SPEED
-      run: |
-        echo "/usr/lib/ccache" >> $GITHUB_PATH
-        ccache -M 5.0G
-        ccache -o compression_level=9
-        ccache -z
-
     - name: Build x86 Cross-Compilation RootFS
       working-directory: runtime
       run: |
+        # This will now succeed perfectly because liblttng-ust-dev:i386 is actually installed!
+        # No sed hacks needed.
         sudo ./eng/common/cross/build-rootfs.sh x86
-
-    - name: Surgically Patch CoreCLR to Use Dummy Provider
-      working-directory: runtime
-      run: |
-        sed -i 's/if(NOT HAVE_LTTNG_TRACEPOINT_H AND FEATURE_EVENT_TRACE)/if(FALSE)/' src/coreclr/pal/src/configure.cmake
-        sed -i 's/if(CLR_CMAKE_HOST_LINUX)/if(FALSE)/' src/coreclr/pal/src/eventprovider/CMakeLists.txt
 
     - name: Install and Patch .NET SDK
       working-directory: runtime
       run: |
         SDK_VERSION=$(python3 -c "import json; print(json.load(open('global.json'))['sdk']['version'])")
+        echo "Installing .NET SDK $SDK_VERSION (x64)"
+        
         mkdir -p .dotnet
         wget -q https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
         chmod +x dotnet-install.sh
+        # We install the x64 SDK because the Debian container is x64. It will cross-compile to x86.
         ./dotnet-install.sh --version $SDK_VERSION --install-dir .dotnet
         
+        # Patch RID Graph to allow linux-x86
         python3 -c "
         import json
         path = '.dotnet/sdk/$SDK_VERSION/RuntimeIdentifierGraph.json'
@@ -71,29 +95,24 @@ jobs:
         if 'linux-x86' not in data['runtimes']:
             data['runtimes']['linux-x86'] = { '#import': ['linux', 'x86'] }
         with open(path, 'w') as f: json.dump(data, f, indent=2)
+        print('Successfully patched RuntimeIdentifierGraph.json')
         "
 
-    - name: Build CoreCLR and Libraries (MAXIMUM PARALLELISM)
+    - name: Build CoreCLR and Libraries
       working-directory: runtime
       env:
         ROOTFS_DIR: ${{ github.workspace }}/runtime/.tools/rootfs/x86
         DOTNET_INSTALL_DIR: ${{ github.workspace }}/runtime/.dotnet
         DOTNET_MULTILEVEL_LOOKUP: 0
       run: |
-        # --ninja aktiviert automatisch maximale CPU-Kern-Nutzung. 
-        # /m und BuildInParallel=true tun dasselbe für MSBuild. Kein -j Flag nötig!
-        ./build.sh -os linux -arch x86 -c Release -subset clr+libs -cross --ninja \
-          /p:UseNinja=true \
-          /p:InvariantGlobalization=false \
-          /p:BuildAppHost=false \
-          /p:BuildInParallel=true \
-          /m
+        # Clean, simple, and fast. Ninja will automatically use all CPU cores.
+        # No hacky MSBuild flags, no sed patches for LTTng.
+        ./build.sh clr+libs -c Release -arch x86 -cross --ninja
 
-    - name: Package Self-Contained Runtime (BULLETPROOF)
+    - name: Package Self-Contained Runtime
       run: |
         mkdir -p dotnet-portable-x86
         
-        # 1. Copy CoreCLR native binaries & System.Private.CoreLib.dll
         CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
         echo "Found CoreCLR dir: $CORECLR_DIR"
         
@@ -106,8 +125,6 @@ jobs:
         cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
         find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
         
-        # 2. Copy the Base Class Library (BCL) DLLs from the libs output
-        # KEIN grep-Filter mehr! Findet einfach die erste System.Runtime.dll
         RUNTIME_DLL=$(find runtime/artifacts/bin/runtime -type f -name "System.Runtime.dll" | head -n 1)
         
         if [ -n "$RUNTIME_DLL" ]; then
@@ -128,7 +145,7 @@ jobs:
         if ! file dotnet-portable-x86/corerun | grep -qi "32-bit"; then
           echo "FATAL: corerun is NOT 32-bit!" && exit 1
         fi
-        echo "=== ldd check (verifying all .so dependencies are found) ==="
+        echo "=== ldd check ==="
         LD_LIBRARY_PATH="$(pwd)/dotnet-portable-x86" ldd dotnet-portable-x86/corerun || true
 
     - name: Create "Run From Anywhere" Launcher
@@ -138,15 +155,13 @@ jobs:
         DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
         export DOTNET_ROOT="$DIR"
         export LD_LIBRARY_PATH="$DIR:$LD_LIBRARY_PATH"
-        ulimit -v unlimited
-        ulimit -m unlimited
         export DOTNET_GCHeapHardLimit=0x40000000
         export DOTNET_TieredCompilation=0
         exec "$DIR/corerun" "$@"
         EOF
         chmod +x dotnet-portable-x86/run.sh
 
-    - name: Install Standard .NET 9 SDK
+    - name: Install Standard .NET 9 SDK (for testing)
       run: |
         wget -q https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
         chmod +x dotnet-install.sh
