@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (The Simple Way)
+name: Build & Test .NET 9 Linux x86 (Pure Debian)
 
 on:
   push:
@@ -27,16 +27,15 @@ jobs:
         sudo sysctl -w vm.overcommit_memory=1
         sudo sysctl -w vm.max_map_count=262144
 
-    - name: Install Build Dependencies
+    - name: Install Build Dependencies (Pure Debian)
       run: |
         apt-get update
-        # Install ubuntu-keyring so debootstrap can verify Ubuntu 22.04 (Jammy) packages
-        apt-get install -y wget curl python3 git cmake ninja-build ccache clang file build-essential sudo debootstrap qemu-user-static ubuntu-keyring
+        apt-get install -y wget curl python3 git cmake ninja-build ccache clang file build-essential sudo debootstrap qemu-user-static
         
         dpkg --add-architecture i386
         apt-get update
         
-        # Ubuntu 22.04 (Jammy) still has full, official 32-bit support!
+        # 100% Pure Debian 12 (Bookworm) 32-bit packages. No Ubuntu.
         apt-get install -y \
           gcc-multilib g++-multilib \
           zlib1g-dev:i386 \
@@ -62,12 +61,17 @@ jobs:
         ref: release/9.0
         path: runtime
 
-    - name: Build x86 Cross-Compilation RootFS
+    - name: Build x86 Cross-Compilation RootFS (Pure Debian)
       working-directory: runtime
       run: |
-        # Use 'jammy' (Ubuntu 22.04). It has all the 32-bit packages we need, 
-        # and the ubuntu-keyring package we installed will allow debootstrap to verify it.
-        sudo ./eng/common/cross/build-rootfs.sh x86 jammy
+        # Fix 1: The script hardcodes the Ubuntu repo for 'x86'. We change it to Debian.
+        sed -i '/x86)/, /;;/ s|__UbuntuRepo="http://archive.ubuntu.com/ubuntu/"|__UbuntuRepo="http://ftp.debian.org/debian/"|' eng/common/cross/build-rootfs.sh
+        
+        # Fix 2: Debian uses 'libunwind-dev', not Ubuntu's 'libunwind8-dev'
+        sed -i 's/libunwind8-dev/libunwind-dev/g' eng/common/cross/build-rootfs.sh
+        
+        # Now run it with 'bookworm'. It will use pure Debian i386 packages natively!
+        sudo ./eng/common/cross/build-rootfs.sh x86 bookworm
 
     - name: Install and Patch .NET SDK
       working-directory: runtime
