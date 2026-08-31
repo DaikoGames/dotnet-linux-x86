@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Pure Debian - Fixed)
+name: Build & Test .NET 9 Linux x86 (Pure Debian - Bulletproof Python)
 
 on:
   push:
@@ -30,10 +30,9 @@ jobs:
     - name: Install Build Dependencies (Pure Debian, FULL install)
       run: |
         apt-get update
-        # KEIN --no-install-recommends! Wir brauchen eine vollständige, funktionierende Umgebung.
-        # ca-certificates ist entscheidend, damit git HTTPS zu GitHub verifizieren kann.
+        # Vollständige Installation, inklusive ca-certificates für git HTTPS
         apt-get install -y \
-          wget curl python3 python3-minimal git cmake ninja-build ccache \
+          wget curl python3 git cmake ninja-build ccache \
           clang file build-essential sudo debootstrap qemu-user-static ca-certificates
         
         dpkg --add-architecture i386
@@ -67,26 +66,27 @@ jobs:
     - name: Build x86 Cross-Compilation RootFS (Pure Debian)
       working-directory: runtime
       run: |
-        # Patch 1: Force Debian repo globally instead of hardcoded Ubuntu repo
         sed -i 's|__UbuntuRepo="http://archive.ubuntu.com/ubuntu/"|__UbuntuRepo="http://deb.debian.org/debian/"|g' eng/common/cross/build-rootfs.sh
-        
-        # Patch 2: Remove 'universe' (Ubuntu-only component)
         sed -i 's/Components: main universe/Components: main/g' eng/common/cross/build-rootfs.sh
-        
-        # Patch 3: Remove 'security' suite (Debian security is on a separate repo)
         sed -i 's/__UbuntuSuites="updates security backports"/__UbuntuSuites="updates backports"/g' eng/common/cross/build-rootfs.sh
-        
-        # Patch 4: Use Debian's libunwind-dev instead of Ubuntu's libunwind8-dev
         sed -i 's/libunwind8-dev/libunwind-dev/g' eng/common/cross/build-rootfs.sh
-        
-        # Patch 5: Fix ancient LLDB version (3.9 doesn't exist in Bookworm, 14 is the default)
         sed -i 's/liblldb-3.9-dev/liblldb-14-dev/g' eng/common/cross/build-rootfs.sh
 
         sudo ./eng/common/cross/build-rootfs.sh x86 bookworm
 
-    - name: Install and Patch .NET SDK
+    - name: Install and Patch .NET SDK (WITH EXPLICIT PYTHON CHECK)
       working-directory: runtime
       run: |
+        # 1. ABSOLUTE SICHERHEIT: Installiere python3 hier noch einmal explizit, 
+        # falls es im vorherigen Step aus irgendeinem Grund nicht im PATH gelandet ist.
+        apt-get update
+        apt-get install -y python3
+        
+        # 2. Verifiziere, dass es wirklich da ist
+        echo "Python version: $(python3 --version)"
+        which python3
+        
+        # 3. Jetzt erst den Rest ausführen
         SDK_VERSION=$(python3 -c "import json; print(json.load(open('global.json'))['sdk']['version'])")
         echo "Installing .NET SDK $SDK_VERSION (x64)"
         
