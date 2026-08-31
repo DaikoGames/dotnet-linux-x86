@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Pure Debian - Barebones Last Stand)
+name: Build & Test .NET 9 Linux x86 (Pure Debian - Dynamic Loading)
 
 on:
   push:
@@ -111,7 +111,7 @@ jobs:
       run: |
         ./build.sh clr+libs -c Release -arch x86 -cross --ninja
 
-    - name: Package Self-Contained Runtime (BAREBONES MINIMAL)
+    - name: Package Self-Contained Runtime (DYNAMIC LOADING)
       run: |
         mkdir -p dotnet-portable-x86
         
@@ -122,26 +122,26 @@ jobs:
         cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
         find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
         
-        # 2. Managed DLLs: BAREBONES WHITELIST (Nur das absolut Nötigste)
+        # 2. Managed DLLs: DYNAMIC LOADING (Keine Whitelist mehr!)
+        # Wir kopieren ALLE Linux-x86 DLLs und lassen corerun entscheiden, was es braucht.
         RUNTIME_DIR=$(find runtime/artifacts/bin/runtime -type d -name "net9.0-linux-Release-x86" | head -n 1)
         echo "Found Runtime dir: $RUNTIME_DIR"
+        cp "$RUNTIME_DIR"/*.dll dotnet-portable-x86/
         
-        WHITELIST="
-        System.Runtime.dll
-        System.Console.dll
-        System.Threading.dll
-        System.Collections.dll
-        System.IO.dll
-        System.Text.Encoding.dll
-        System.Text.Encoding.Extensions.dll
-        System.Runtime.Extensions.dll
-        "
-        
-        for dll in $WHITELIST; do
-          if [ -f "$RUNTIME_DIR/$dll" ]; then
-            cp "$RUNTIME_DIR/$dll" dotnet-portable-x86/
-          fi
-        done
+        # 3. Aggressives Filtern von Windows-Ballast, der physisch nichts auf Linux zu suchen hat
+        rm -f dotnet-portable-x86/System.Windows*.dll
+        rm -f dotnet-portable-x86/WindowsBase.dll
+        rm -f dotnet-portable-x86/System.Web*.dll
+        rm -f dotnet-portable-x86/System.Drawing*.dll
+        rm -f dotnet-portable-x86/System.Data.SqlClient.dll
+        rm -f dotnet-portable-x86/System.Management.dll
+        rm -f dotnet-portable-x86/System.ServiceProcess*.dll
+        rm -f dotnet-portable-x86/Microsoft.Win32*.dll
+        rm -f dotnet-portable-x86/System.DirectoryServices*.dll
+        rm -f dotnet-portable-x86/System.Speech.dll
+        rm -f dotnet-portable-x86/System.ServiceModel*.dll
+        rm -f dotnet-portable-x86/System.CodeDom.dll
+        rm -f dotnet-portable-x86/Microsoft.VisualBasic.dll
         
         echo "FINAL Packaged DLL count: $(ls -1 dotnet-portable-x86/*.dll | wc -l)"
 
@@ -155,7 +155,7 @@ jobs:
         echo "=== ldd check ==="
         LD_LIBRARY_PATH="$(pwd)/dotnet-portable-x86" ldd dotnet-portable-x86/corerun || true
 
-    - name: Create "Run From Anywhere" Launcher (EXTREME SURVIVAL MODE)
+    - name: Create "Run From Anywhere" Launcher (DYNAMIC MEMORY)
       run: |
         cat << 'EOF' > dotnet-portable-x86/run.sh
         #!/bin/bash
@@ -165,14 +165,11 @@ jobs:
         ulimit -v unlimited
         ulimit -m unlimited
         
-        # EXTREME SURVIVAL MODE for 32-bit
+        # DYNAMIC MEMORY MANAGEMENT (wie unter Windows)
+        # Workstation GC (kein Server GC, der auf 32-Bit immer OOM verursacht)
         export DOTNET_gcServer=0
-        export DOTNET_GCHeapHardLimit=0x04000000
-        export DOTNET_GCHeapHardLimitPercent=5
-        export DOTNET_TieredCompilation=0
-        export DOTNET_ReadyToRun=0
-        export DOTNET_JitMinOpts=1
         
+        # Disable ASLR (-R) to prevent virtual memory fragmentation on 64-bit host
         exec setarch i686 -R "$DIR/corerun" "$@"
         EOF
         chmod +x dotnet-portable-x86/run.sh
@@ -183,21 +180,29 @@ jobs:
         chmod +x dotnet-install.sh
         ./dotnet-install.sh --channel 9.0 --install-dir ./dotnet-sdk
 
-    - name: Create & Compile ULTRA-Minimal Test
+    - name: Create & Compile IL Stress Test
       run: |
         ./dotnet-sdk/dotnet new console -n IL_Stress_Test -o IL_Stress_Test --framework net9.0
         cat << 'CSHARP' > IL_Stress_Test/Program.cs
         using System;
+        using System.Threading;
         using System.Runtime.InteropServices;
 
         class Program {
             static int Main() {
-                Console.WriteLine("=== ULTRA MINIMAL TEST START ===");
-                Console.WriteLine("If you see this, the runtime initialized successfully!");
+                Console.WriteLine("=== Starting IL Stress Test for Linux x86 ===");
+                double result = 0;
+                for(int i=0; i<10000; i++) result += Math.Sin(i) * Math.Cos(i);
+                Console.WriteLine($"[PASS] Math/SSE Stack Alignment: {result}");
+                
+                byte[][] arrays = new byte[10][];
+                for(int i=0; i<10; i++) arrays[i] = new byte[1024 * 1024]; 
+                GC.Collect();
+                Console.WriteLine("[PASS] GC & Memory Allocation");
                 
                 int pid = getpid();
                 Console.WriteLine($"[PASS] P/Invoke (libc getpid): {pid}");
-                Console.WriteLine("=== TEST PASSED ===");
+                Console.WriteLine("=== ALL IL TESTS PASSED! RUNTIME IS STABLE ===");
                 return 0;
             }
             [DllImport("libc")]
@@ -206,7 +211,7 @@ jobs:
         CSHARP
         ./dotnet-sdk/dotnet build IL_Stress_Test -c Release
 
-    - name: Execute Ultra-Minimal Test
+    - name: Execute IL Stress Test
       run: |
         ./dotnet-portable-x86/run.sh ./IL_Stress_Test/bin/Release/net9.0/IL_Stress_Test.dll
 
