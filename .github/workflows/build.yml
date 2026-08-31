@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Targeted TPA Fix)
+name: Build & Test .NET 9 Linux x86 (LD_LIBRARY_PATH Fix)
 
 on:
   push:
@@ -63,7 +63,6 @@ jobs:
         chmod +x dotnet-install.sh
         ./dotnet-install.sh --version $SDK_VERSION --install-dir .dotnet
         
-        # FIX: Correctly import BOTH 'linux' and 'x86' to satisfy strict SDK validation
         python3 -c "
         import json
         path = '.dotnet/sdk/$SDK_VERSION/RuntimeIdentifierGraph.json'
@@ -73,15 +72,13 @@ jobs:
         with open(path, 'w') as f: json.dump(data, f, indent=2)
         "
 
-    - name: Build CoreCLR and Libraries (NO HOST)
+    - name: Build CoreCLR and Libraries
       working-directory: runtime
       env:
         ROOTFS_DIR: ${{ github.workspace }}/runtime/.tools/rootfs/x86
         DOTNET_INSTALL_DIR: ${{ github.workspace }}/runtime/.dotnet
         DOTNET_MULTILEVEL_LOOKUP: 0
       run: |
-        # We stick to clr+libs. This successfully builds corerun and the BCL.
-        # Building 'host' triggers hardcoded SDK checks that are a losing battle.
         ./build.sh -os linux -arch x86 -c Release -subset clr+libs -cross --ninja \
           /p:UseNinja=true /p:InvariantGlobalization=false /p:BuildAppHost=false
 
@@ -89,26 +86,19 @@ jobs:
       run: |
         mkdir -p dotnet-portable-x86
         
-        # 1. Copy native CoreCLR binaries
         CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
         echo "Found CoreCLR dir: $CORECLR_DIR"
         cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
         cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
         
-        # 2. CRITICAL FIX: Find the EXACT directory containing the x86 Shared Framework
-        # This prevents copying desktop bloat (System.Windows.dll, etc.) that causes 
-        # the 32-bit TPA parser to overflow and throw 0x8007000e.
         CORELIB_PATH=$(find runtime/artifacts/bin -type f -name "System.Private.CoreLib.dll" | grep -i "linux.x86.release" | head -n 1)
         
         if [ -n "$CORELIB_PATH" ]; then
           CORELIB_DIR=$(dirname "$CORELIB_PATH")
           echo "Found pure Shared Framework dir: $CORELIB_DIR"
-          
-          # Copy ONLY the DLLs from this specific, minimal shared framework directory
           cp "$CORELIB_DIR"/*.dll dotnet-portable-x86/
         else
           echo "FATAL ERROR: Could not find System.Private.CoreLib.dll for linux.x86.release!"
-          find runtime/artifacts/bin -name "System.Private.CoreLib.dll" | head -n 10
           exit 1
         fi
         
@@ -121,23 +111,25 @@ jobs:
         if ! file dotnet-portable-x86/corerun | grep -qi "32-bit"; then
           echo "FATAL: corerun is NOT 32-bit!" && exit 1
         fi
-        echo "=== ldd check (looking for missing .so files) ==="
-        ldd dotnet-portable-x86/corerun || true
+        echo "=== ldd check (verifying all .so dependencies are found) ==="
+        # We temporarily set LD_LIBRARY_PATH here just for the ldd check to prove it works
+        LD_LIBRARY_PATH="$(pwd)/dotnet-portable-x86" ldd dotnet-portable-x86/corerun || true
 
-    - name: Create "Run From Anywhere" Launcher
+    - name: Create "Run From Anywhere" Launcher (WITH LD_LIBRARY_PATH FIX)
       run: |
         cat << 'EOF' > dotnet-portable-x86/run.sh
         #!/bin/bash
         DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
         export DOTNET_ROOT="$DIR"
+        
+        # CRITICAL FIX: Tell the Linux dynamic linker to look in the current 
+        # directory for libcoreclrpal.so and other native dependencies FIRST.
+        export LD_LIBRARY_PATH="$DIR:$LD_LIBRARY_PATH"
+        
         ulimit -v unlimited
         ulimit -m unlimited
         export DOTNET_GCHeapHardLimit=0x40000000
         export DOTNET_TieredCompilation=0
-        
-        # Ultimate diagnostic: prints exact missing .so or mmap failure
-        export LD_DEBUG=libs
-        export CORECLR_TRACE=1
         
         exec "$DIR/corerun" "$@"
         EOF
@@ -164,7 +156,6 @@ jobs:
                 for(int i=0; i<10000; i++) result += Math.Sin(i) * Math.Cos(i);
                 Console.WriteLine($"[PASS] Math/SSE Stack Alignment: {result}");
                 
-                // Reduced memory allocation to be extra safe on 32-bit
                 byte[][] arrays = new byte[10][];
                 for(int i=0; i<10; i++) arrays[i] = new byte[1024 * 1024]; 
                 GC.Collect();
