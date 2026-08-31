@@ -63,20 +63,20 @@ jobs:
     - name: Build x86 Cross-Compilation RootFS (Pure Debian)
       working-directory: runtime
       run: |
-        # Patch 1: Force Debian repo for x86 instead of Ubuntu
-        sed -i '/^[[:space:]]*x86)/,/;;/ s|__UbuntuRepo="http://archive.ubuntu.com/ubuntu/"|__UbuntuRepo="http://deb.debian.org/debian/"|' eng/common/cross/build-rootfs.sh
+        # Patch 1: Force Debian repo globally instead of hardcoded Ubuntu repo
+        sed -i 's|__UbuntuRepo="http://archive.ubuntu.com/ubuntu/"|__UbuntuRepo="http://deb.debian.org/debian/"|g' eng/common/cross/build-rootfs.sh
         
-        # Patch 2: Remove 'universe' (Ubuntu-only) from components
-        sed -i 's/Components: main universe/Components: main/' eng/common/cross/build-rootfs.sh
+        # Patch 2: Remove 'universe' (Ubuntu-only component)
+        sed -i 's/Components: main universe/Components: main/g' eng/common/cross/build-rootfs.sh
         
-        # Patch 3: Remove 'security' suite
-        sed -i 's/__UbuntuSuites="updates security backports"/__UbuntuSuites="updates backports"/' eng/common/cross/build-rootfs.sh
+        # Patch 3: Remove 'security' suite (Debian security is on a separate repo, updates/backports is enough for build deps)
+        sed -i 's/__UbuntuSuites="updates security backports"/__UbuntuSuites="updates backports"/g' eng/common/cross/build-rootfs.sh
         
         # Patch 4: Use Debian's libunwind-dev instead of Ubuntu's libunwind8-dev
         sed -i 's/libunwind8-dev/libunwind-dev/g' eng/common/cross/build-rootfs.sh
         
-        # Patch 5: Fix LLDB version for Bookworm (3.9 is ancient, Bookworm has 14+)
-        sed -i '/^[[:space:]]*bookworm)/,/;;/ s/__LLDB_Package="liblldb-3.9-dev"/__LLDB_Package="liblldb-14-dev"/' eng/common/cross/build-rootfs.sh
+        # Patch 5: Fix ancient LLDB version (3.9 doesn't exist in Bookworm, 14 is the default)
+        sed -i 's/liblldb-3.9-dev/liblldb-14-dev/g' eng/common/cross/build-rootfs.sh
 
         sudo ./eng/common/cross/build-rootfs.sh x86 bookworm
 
