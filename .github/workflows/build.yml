@@ -35,7 +35,6 @@ jobs:
         dpkg --add-architecture i386
         apt-get update
         
-        # 100% Pure Debian 12 (Bookworm) 32-bit packages. No Ubuntu.
         apt-get install -y \
           gcc-multilib g++-multilib \
           zlib1g-dev:i386 \
@@ -70,13 +69,15 @@ jobs:
         # Patch 2: Remove 'universe' (Ubuntu-only) from components
         sed -i 's/Components: main universe/Components: main/' eng/common/cross/build-rootfs.sh
         
-        # Patch 3: Remove 'security' suite (Debian security is on a different repo, updates/backports is sufficient for build deps)
+        # Patch 3: Remove 'security' suite
         sed -i 's/__UbuntuSuites="updates security backports"/__UbuntuSuites="updates backports"/' eng/common/cross/build-rootfs.sh
         
         # Patch 4: Use Debian's libunwind-dev instead of Ubuntu's libunwind8-dev
         sed -i 's/libunwind8-dev/libunwind-dev/g' eng/common/cross/build-rootfs.sh
+        
+        # Patch 5: Fix LLDB version for Bookworm (3.9 is ancient, Bookworm has 14+)
+        sed -i '/^[[:space:]]*bookworm)/,/;;/ s/__LLDB_Package="liblldb-3.9-dev"/__LLDB_Package="liblldb-14-dev"/' eng/common/cross/build-rootfs.sh
 
-        # Now run it with 'bookworm'. It will use pure Debian i386 packages natively!
         sudo ./eng/common/cross/build-rootfs.sh x86 bookworm
 
     - name: Install and Patch .NET SDK
