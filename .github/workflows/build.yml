@@ -127,12 +127,11 @@ jobs:
         cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
         find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
         
-        # CRITICAL FIX: Explicitly target the linux-x86 release folder for runtime DLLs.
-        # This prevents copying Windows-specific DLLs (like System.Windows.dll) which 
-        # bloat the TPA list and cause 32-bit OOM (0x8007000e) during initialization.
-        RUNTIME_DIR=$(find runtime/artifacts/bin/runtime -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" -o -name "linux-x86-Release" \) | head -n 1)
+        # KORRIGIERT: Suche nach der Datei, nicht nach dem Ordnernamen, da der Ordner "net9.0-linux-Release-x86" heißt
+        RUNTIME_DLL=$(find runtime/artifacts/bin/runtime -type f -name "System.Runtime.dll" | head -n 1)
         
-        if [ -n "$RUNTIME_DIR" ] && [ -d "$RUNTIME_DIR" ]; then
+        if [ -n "$RUNTIME_DLL" ]; then
+          RUNTIME_DIR=$(dirname "$RUNTIME_DLL")
           echo "Found Runtime dir: $RUNTIME_DIR"
           
           # Copy DLLs, but actively skip known Windows-only assemblies
@@ -148,7 +147,7 @@ jobs:
             esac
           done
         else
-          echo "FATAL ERROR: Could not find the linux-x86 Release runtime directory!"
+          echo "FATAL ERROR: Could not find System.Runtime.dll!"
           find runtime/artifacts/bin/runtime -type d | head -n 20
           exit 1
         fi
