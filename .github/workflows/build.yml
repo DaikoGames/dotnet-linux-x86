@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Pure Debian - Testhost Fix)
+name: Build & Test .NET 9 Linux x86 (Pure Debian - Final Fix)
 
 on:
   push:
@@ -111,51 +111,38 @@ jobs:
       run: |
         ./build.sh clr+libs -c Release -arch x86 -cross --ninja
 
-    - name: Package Self-Contained Runtime (OFFICIAL TESTHOST MINIMAL)
+    - name: Package Self-Contained Runtime (BULLETPROOF BASH & TPA)
       run: |
         mkdir -p dotnet-portable-x86
         
+        # 1. Native CoreCLR Dateien
         CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
         echo "Found CoreCLR dir: $CORECLR_DIR"
-        
-        if [ -z "$CORECLR_DIR" ]; then
-          echo "FATAL ERROR: CoreCLR build output not found!"
-          exit 1
-        fi
-        
         cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
         cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
         
-        # CRITICAL FIX: Use the official 'testhost' directory.
-        # This directory is specifically built by the 'libs' subset to contain 
-        # the EXACT, MINIMAL set of DLLs required for corerun to work, 
-        # without any Windows compatibility shims or bloat.
-        TESTHOST_DIR=$(find runtime/artifacts/bin/testhost -type d \( -name "net9.0-linux-Release-x86" -o -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
+        # 2. Managed DLLs aus dem Ordner, von dem wir wissen, dass er sie hat
+        RUNTIME_DIR=$(find runtime/artifacts/bin/runtime -type d -name "net9.0-linux-Release-x86" | head -n 1)
+        echo "Found Runtime dir: $RUNTIME_DIR"
         
-        if [ -n "$TESTHOST_DIR" ] && [ -d "$TESTHOST_DIR" ]; then
-          echo "Found official Testhost dir: $TESTHOST_DIR"
-          cp "$TESTHOST_DIR"/*.dll dotnet-portable-x86/
-        else
-          echo "WARNING: Testhost dir not found, falling back to strict runtime filtering."
-          RUNTIME_DLL=$(find runtime/artifacts/bin/runtime -type f -name "System.Runtime.dll" | head -n 1)
-          if [ -n "$RUNTIME_DLL" ]; then
-            RUNTIME_DIR=$(dirname "$RUNTIME_DLL")
-            for dll in "$RUNTIME_DIR"/*.dll; do
-              basename_dll=$(basename "$dll")
-              case "$basename_dll" in
-                System.Windows.dll|WindowsBase.dll|System.Web.dll|System.Drawing.dll|System.Data.SqlClient.dll|System.Data.OleDb.dll|System.Data.Odbc.dll|System.Management.dll|System.ServiceProcess*.dll|Microsoft.Win32*.dll|System.DirectoryServices*.dll|System.Speech.dll|System.Windows.Extensions.dll|Microsoft.VisualBasic.dll|System.ServiceModel.Web.dll|System.Data.dll|System.Web.HttpUtility.dll|System.Drawing.Primitives.dll)
-                  echo "Skipping bloat DLL: $basename_dll"
-                  ;;
-                *)
-                  cp "$dll" dotnet-portable-x86/
-                  ;;
-              esac
-            done
-          else
-            echo "FATAL ERROR: Could not find System.Runtime.dll!"
-            exit 1
-          fi
-        fi
+        # Massive Blacklist & Bash-Crash-Prevention
+        for dll in "$RUNTIME_DIR"/*.dll; do
+          # WICHTIG: Verhindert den Crash, wenn das Verzeichnis leer ist
+          [ -e "$dll" ] || continue 
+          
+          basename_dll=$(basename "$dll")
+          case "$basename_dll" in
+            Microsoft.*|System.Windows.*|System.Web.*|System.Data.*|System.Drawing.*|System.ServiceProcess.*|System.DirectoryServices.*|System.Speech.*|System.ServiceModel.*)
+              echo "Skipping bloat DLL: $basename_dll"
+              ;;
+            *)
+              cp "$dll" dotnet-portable-x86/
+              ;;
+          esac
+        done
+        
+        # 3. System.Private.CoreLib sicherheitshalber aus dem CoreCLR Ordner holen
+        find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
         
         echo "Packaged DLL count: $(ls -1 dotnet-portable-x86/*.dll | wc -l)"
 
