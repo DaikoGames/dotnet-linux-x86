@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Pure Debian - Final CMake Fix)
+name: Build & Test .NET 9 Linux x86 (Pure Debian - Strict TPA Fix)
 
 on:
   push:
@@ -95,20 +95,12 @@ jobs:
         with open(path, 'w') as f: json.dump(data, f, indent=2)
         "
 
-    - name: Patch CoreCLR CMake to Bypass LTTng (CRITICAL FIX)
+    - name: Patch CoreCLR CMake to Bypass LTTng
       working-directory: runtime
       run: |
-        # CRITICAL: CMake searches the 32-bit sysroot for LTTng headers and fails to find them.
-        # We surgically disable the LTTng check and force the use of the built-in dummy provider.
-        # This is 100% safe for our use case and guarantees the build will complete.
-        
-        # 1. Disable the FATAL_ERROR in configure.cmake if LTTng is missing
         sed -i 's/if(NOT HAVE_LTTNG_TRACEPOINT_H AND FEATURE_EVENT_TRACE)/if(FALSE)/' src/coreclr/pal/src/configure.cmake
-        
-        # 2. Force the use of the dummy provider instead of the lttng provider
         sed -i 's/if(CLR_CMAKE_HOST_LINUX)/if(FALSE)/' src/coreclr/pal/src/eventprovider/CMakeLists.txt
-        
-        echo "Successfully patched CoreCLR to bypass LTTng and use dummy provider."
+        echo "Successfully patched CoreCLR to bypass LTTng."
 
     - name: Build CoreCLR and Libraries
       working-directory: runtime
@@ -119,7 +111,7 @@ jobs:
       run: |
         ./build.sh clr+libs -c Release -arch x86 -cross --ninja
 
-    - name: Package Self-Contained Runtime
+    - name: Package Self-Contained Runtime (STRICT LINUX-X86 ONLY)
       run: |
         mkdir -p dotnet-portable-x86
         
@@ -135,14 +127,29 @@ jobs:
         cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
         find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
         
-        RUNTIME_DLL=$(find runtime/artifacts/bin/runtime -type f -name "System.Runtime.dll" | head -n 1)
+        # CRITICAL FIX: Explicitly target the linux-x86 release folder for runtime DLLs.
+        # This prevents copying Windows-specific DLLs (like System.Windows.dll) which 
+        # bloat the TPA list and cause 32-bit OOM (0x8007000e) during initialization.
+        RUNTIME_DIR=$(find runtime/artifacts/bin/runtime -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" -o -name "linux-x86-Release" \) | head -n 1)
         
-        if [ -n "$RUNTIME_DLL" ]; then
-          BCL_DIR=$(dirname "$RUNTIME_DLL")
-          echo "Found BCL dir: $BCL_DIR"
-          cp "$BCL_DIR"/*.dll dotnet-portable-x86/
+        if [ -n "$RUNTIME_DIR" ] && [ -d "$RUNTIME_DIR" ]; then
+          echo "Found Runtime dir: $RUNTIME_DIR"
+          
+          # Copy DLLs, but actively skip known Windows-only assemblies
+          for dll in "$RUNTIME_DIR"/*.dll; do
+            basename_dll=$(basename "$dll")
+            case "$basename_dll" in
+              System.Windows.dll|WindowsBase.dll|System.Web.dll|System.Drawing.dll|System.Data.SqlClient.dll|System.Data.OleDb.dll|System.Data.Odbc.dll|System.Management.dll|System.ServiceProcess*.dll|Microsoft.Win32*.dll|System.DirectoryServices*.dll|System.Speech.dll)
+                echo "Skipping Windows-specific DLL: $basename_dll"
+                ;;
+              *)
+                cp "$dll" dotnet-portable-x86/
+                ;;
+            esac
+          done
         else
-          echo "FATAL ERROR: Could not find System.Runtime.dll in libs output!"
+          echo "FATAL ERROR: Could not find the linux-x86 Release runtime directory!"
+          find runtime/artifacts/bin/runtime -type d | head -n 20
           exit 1
         fi
         
