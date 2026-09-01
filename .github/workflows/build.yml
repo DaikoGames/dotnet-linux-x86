@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Pure Debian - Final QEMU + GC Limit)
+name: Build & Test .NET 9 Linux x86 (Pure Debian - W^X Fix & Native Host)
 
 on:
   push:
@@ -32,7 +32,7 @@ jobs:
         apt-get update
         apt-get install -y \
           wget curl python3 git cmake ninja-build ccache \
-          clang file build-essential sudo debootstrap qemu-user qemu-user-static ca-certificates
+          clang file build-essential sudo debootstrap qemu-user-static ca-certificates
         
         dpkg --add-architecture i386
         apt-get update
@@ -156,7 +156,7 @@ jobs:
         echo "=== ldd check ==="
         LD_LIBRARY_PATH="$(pwd)/dotnet-portable-x86" ldd dotnet-portable-x86/corerun || true
 
-    - name: Create "Run From Anywhere" Launcher (PHYSICAL 32-BIT LIMITS)
+    - name: Create "Run From Anywhere" Launcher (W^X & NATIVE HOST FIX)
       run: |
         cat << 'EOF' > dotnet-portable-x86/run.sh
         #!/bin/bash
@@ -164,17 +164,20 @@ jobs:
         export DOTNET_ROOT="$DIR"
         export LD_LIBRARY_PATH="$DIR:$LD_LIBRARY_PATH"
         
-        # PHYSIKALISCHE NOTWENDIGKEIT FÜR 32-BIT:
-        # Der .NET GC versucht standardmäßig, ~1.5 GB zusammenhängenden virtuellen Speicher zu reservieren.
-        # Auf 32-Bit ist dieser Block oft nicht verfügbar. Wir begrenzen ihn auf 256 MB (0x10000000).
-        # Innerhalb dieser 256 MB arbeitet der GC weiterhin dynamisch und prozentual wie gewünscht!
-        export DOTNET_gcServer=0
-        export DOTNET_GCHeapHardLimit=0x10000000
-        export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
-        export DOTNET_TieredCompilation=0
+        # DER ECHTE FIX FÜR DOCKER/JIT:
+        # Docker blockiert oft mmap(PROT_EXEC) für anonyme Seiten. Der JIT braucht das aber.
+        # Diese Variable zwingt die CLR, RWX-Speicher zu nutzen oder alternative Pfade zu gehen.
+        export DOTNET_EnableWriteXorExecute=0
         
-        # QEMU stellt den perfekten 32-Bit-Adressraum bereit.
-        exec qemu-i386 -L "$DIR" "$DIR/corerun" "$@"
+        # Deaktiviert EventPipe und Debugging-Overhead, spart massiv Memory beim Start
+        export DOTNET_EnableDiagnostics=0
+        
+        # Workstation GC (kein Server GC auf 32-Bit)
+        export DOTNET_gcServer=0
+        
+        # Keine QEMU-Emulation mehr! QEMU fragmentiert den 32-Bit-Speicher nur.
+        # Wir nutzen den nativen Host mit setarch, um ASLR zu deaktivieren.
+        exec setarch i686 -R "$DIR/corerun" "$@"
         EOF
         chmod +x dotnet-portable-x86/run.sh
 
