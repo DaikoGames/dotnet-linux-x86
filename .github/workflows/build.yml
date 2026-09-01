@@ -24,7 +24,8 @@ jobs:
     - name: Install Build Dependencies
       run: |
         apt-get update
-        apt-get install -y wget curl python3 git cmake ninja-build ccache clang file build-essential sudo debootstrap ca-certificates
+        # HIER WURDE 'zip' HINZUGEFÜGT
+        apt-get install -y wget curl python3 git cmake ninja-build ccache clang file build-essential sudo debootstrap ca-certificates zip
         dpkg --add-architecture i386
         apt-get update
         apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libssl-dev:i386 libunwind-dev:i386 liblttng-ust-dev:i386 binutils libc6-dev-i386 libstdc++-12-dev:i386
