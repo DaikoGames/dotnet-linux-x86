@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Pure Debian - Dynamic Loading)
+name: Build & Test .NET 9 Linux x86 (Pure Debian - Native QEMU Execution)
 
 on:
   push:
@@ -30,9 +30,10 @@ jobs:
     - name: Install Build Dependencies (Pure Debian, FULL install)
       run: |
         apt-get update
+        # WICHTIG: qemu-user stellt den echten 32-Bit-Emulator (qemu-i386) bereit
         apt-get install -y \
           wget curl python3 git cmake ninja-build ccache \
-          clang file build-essential sudo debootstrap qemu-user-static ca-certificates
+          clang file build-essential sudo debootstrap qemu-user qemu-user-static ca-certificates
         
         dpkg --add-architecture i386
         apt-get update
@@ -122,13 +123,12 @@ jobs:
         cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
         find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
         
-        # 2. Managed DLLs: DYNAMIC LOADING (Keine Whitelist mehr!)
-        # Wir kopieren ALLE Linux-x86 DLLs und lassen corerun entscheiden, was es braucht.
+        # 2. Managed DLLs: DYNAMIC LOADING
         RUNTIME_DIR=$(find runtime/artifacts/bin/runtime -type d -name "net9.0-linux-Release-x86" | head -n 1)
         echo "Found Runtime dir: $RUNTIME_DIR"
         cp "$RUNTIME_DIR"/*.dll dotnet-portable-x86/
         
-        # 3. Aggressives Filtern von Windows-Ballast, der physisch nichts auf Linux zu suchen hat
+        # 3. Entfernen von reinen Windows-Bibliotheken, die auf Linux nichts zu suchen haben
         rm -f dotnet-portable-x86/System.Windows*.dll
         rm -f dotnet-portable-x86/WindowsBase.dll
         rm -f dotnet-portable-x86/System.Web*.dll
@@ -155,7 +155,7 @@ jobs:
         echo "=== ldd check ==="
         LD_LIBRARY_PATH="$(pwd)/dotnet-portable-x86" ldd dotnet-portable-x86/corerun || true
 
-    - name: Create "Run From Anywhere" Launcher (DYNAMIC MEMORY)
+    - name: Create "Run From Anywhere" Launcher (NATIVE QEMU EXECUTION)
       run: |
         cat << 'EOF' > dotnet-portable-x86/run.sh
         #!/bin/bash
@@ -166,11 +166,13 @@ jobs:
         ulimit -m unlimited
         
         # DYNAMIC MEMORY MANAGEMENT (wie unter Windows)
-        # Workstation GC (kein Server GC, der auf 32-Bit immer OOM verursacht)
+        # Workstation GC ist sicherer für 32-Bit, aber ohne harte Limits, die den Start verhindern
         export DOTNET_gcServer=0
         
-        # Disable ASLR (-R) to prevent virtual memory fragmentation on 64-bit host
-        exec setarch i686 -R "$DIR/corerun" "$@"
+        # DER GAMECHANGER: qemu-i386 stellt einen echten, sauberen 32-Bit-Adressraum bereit.
+        # Kein Kampf mehr mit dem 64-Bit-Host-Kernel. .NET kann dynamisch und prozentual arbeiten.
+        # -L weist QEMU an, die Bibliotheken in unserem portable-Ordner zu suchen.
+        exec qemu-i386 -L "$DIR" "$DIR/corerun" "$@"
         EOF
         chmod +x dotnet-portable-x86/run.sh
 
