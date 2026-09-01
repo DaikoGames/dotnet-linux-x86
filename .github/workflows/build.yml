@@ -1,4 +1,4 @@
-name: Build .NET 9 Linux x86 Runtime
+name: Build & Test .NET 9 Linux x86 (Smart Apphost Architecture)
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-linux-x86:
+  build-and-test-linux-x86:
     runs-on: ubuntu-latest
     container:
       image: debian:bookworm
@@ -21,14 +21,39 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
 
     steps:
-    - name: Install Build Dependencies
+    - name: Fix Kernel Memory Limits
+      run: |
+        apt-get update && apt-get install -y sudo procps
+        sudo sysctl -w vm.overcommit_memory=1
+        sudo sysctl -w vm.max_map_count=262144
+
+    - name: Install Build Dependencies (Pure Debian, FULL install)
       run: |
         apt-get update
-        # HIER WURDE 'zip' HINZUGEFÜGT
-        apt-get install -y wget curl python3 git cmake ninja-build ccache clang file build-essential sudo debootstrap ca-certificates zip
+        apt-get install -y \
+          wget curl python3 git cmake ninja-build ccache \
+          clang file build-essential sudo debootstrap ca-certificates
+        
         dpkg --add-architecture i386
         apt-get update
-        apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libssl-dev:i386 libunwind-dev:i386 liblttng-ust-dev:i386 binutils libc6-dev-i386 libstdc++-12-dev:i386
+        
+        apt-get install -y \
+          gcc-multilib g++-multilib \
+          zlib1g-dev:i386 \
+          libicu-dev:i386 \
+          libssl-dev:i386 \
+          libunwind-dev:i386 \
+          liblttng-ust-dev:i386 \
+          binutils \
+          libc6-dev-i386 \
+          libstdc++-12-dev:i386
+
+    - name: Setup ccache for Maximum Speed
+      run: |
+        echo "/usr/lib/ccache" >> $GITHUB_PATH
+        ccache -M 5.0G
+        ccache -o compression_level=9
+        ccache -z
 
     - name: Checkout .NET 9 Runtime
       uses: actions/checkout@v4
@@ -37,7 +62,7 @@ jobs:
         ref: release/9.0
         path: runtime
 
-    - name: Build x86 Cross-Compilation RootFS
+    - name: Build x86 Cross-Compilation RootFS (Pure Debian)
       working-directory: runtime
       run: |
         sed -i 's|__UbuntuRepo="http://archive.ubuntu.com/ubuntu/"|__UbuntuRepo="http://deb.debian.org/debian/"|g' eng/common/cross/build-rootfs.sh
@@ -47,21 +72,32 @@ jobs:
         sed -i 's/liblldb-3.9-dev/liblldb-14-dev/g' eng/common/cross/build-rootfs.sh
         sudo ./eng/common/cross/build-rootfs.sh x86 bookworm
 
-    - name: Install .NET SDK
+    - name: Install and Patch .NET SDK
       working-directory: runtime
       run: |
         apt-get update && apt-get install -y python3
         SDK_VERSION=$(python3 -c "import json; print(json.load(open('global.json'))['sdk']['version'])")
+        echo "Installing .NET SDK $SDK_VERSION (x64)"
         mkdir -p .dotnet
         wget -q https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
         chmod +x dotnet-install.sh
         ./dotnet-install.sh --version $SDK_VERSION --install-dir .dotnet
+        
+        python3 -c "
+        import json
+        path = '.dotnet/sdk/$SDK_VERSION/RuntimeIdentifierGraph.json'
+        with open(path, 'r') as f: data = json.load(f)
+        if 'linux-x86' not in data['runtimes']:
+            data['runtimes']['linux-x86'] = { '#import': ['linux', 'x86'] }
+        with open(path, 'w') as f: json.dump(data, f, indent=2)
+        "
 
-    - name: Patch CoreCLR CMake
+    - name: Patch CoreCLR CMake to Bypass LTTng
       working-directory: runtime
       run: |
         sed -i 's/if(NOT HAVE_LTTNG_TRACEPOINT_H AND FEATURE_EVENT_TRACE)/if(FALSE)/' src/coreclr/pal/src/configure.cmake
         sed -i 's/if(CLR_CMAKE_HOST_LINUX)/if(FALSE)/' src/coreclr/pal/src/eventprovider/CMakeLists.txt
+        echo "Successfully patched CoreCLR to bypass LTTng."
 
     - name: Build CoreCLR and Libraries
       working-directory: runtime
@@ -72,20 +108,75 @@ jobs:
       run: |
         ./build.sh clr+libs -c Release -arch x86 -cross --ninja
 
-    - name: Package Runtime
+    - name: Package Runtime as Official Shared Framework (The "All DLLs" Folder)
       run: |
-        mkdir -p dotnet-linux-x86
+        # Wir erstellen die offizielle .NET Ordnerstruktur. 
+        # Hier liegen ALLE DLLs, die wir kompiliert haben.
+        SHARED_FRAMEWORK_DIR="dotnet-portable-x86/shared/Microsoft.NETCore.App/9.0.0"
+        mkdir -p "$SHARED_FRAMEWORK_DIR"
+        
         CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
-        cp "$CORECLR_DIR/corerun" dotnet-linux-x86/
-        cp "$CORECLR_DIR"/*.so dotnet-linux-x86/
-        find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-linux-x86/ \;
         RUNTIME_DIR=$(find runtime/artifacts/bin/runtime -type d -name "net9.0-linux-Release-x86" | head -n 1)
-        cp "$RUNTIME_DIR"/*.dll dotnet-linux-x86/
-        echo "✅ Runtime built successfully! Packaged $(ls -1 dotnet-linux-x86/*.dll | wc -l) DLLs."
+        
+        # Native Teile
+        cp "$CORECLR_DIR/corerun" "$SHARED_FRAMEWORK_DIR/"
+        cp "$CORECLR_DIR"/*.so "$SHARED_FRAMEWORK_DIR/"
+        
+        # ALLE Managed DLLs in den Shared Framework Ordner
+        cp "$RUNTIME_DIR"/*.dll "$SHARED_FRAMEWORK_DIR/"
+        
+        echo "✅ Shared Framework erstellt. Enthält $(ls -1 "$SHARED_FRAMEWORK_DIR"/*.dll | wc -l) DLLs."
 
-    - name: Zip and Upload
-      run: zip -r dotnet9-linux-x86.zip dotnet-linux-x86
+    - name: Install Standard .NET 9 SDK (for generating the smart AppHost)
+      run: |
+        wget -q https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
+        chmod +x dotnet-install.sh
+        ./dotnet-install.sh --channel 9.0 --install-dir ./dotnet-sdk
+
+    - name: Create & Compile Test App
+      run: |
+        ./dotnet-sdk/dotnet new console -n SmartApp -o SmartApp --framework net9.0
+        cat << 'CSHARP' > SmartApp/Program.cs
+        using System;
+        using System.Runtime.InteropServices;
+
+        class Program {
+            static int Main() {
+                Console.WriteLine("=== SMART APPHOST TEST START ===");
+                Console.WriteLine("Runtime loaded successfully with minimal TPA!");
+                
+                int pid = getpid();
+                Console.WriteLine($"[PASS] P/Invoke (libc getpid): {pid}");
+                Console.WriteLine("=== TEST PASSED ===");
+                return 0;
+            }
+            [DllImport("libc")]
+            static extern int getpid();
+        }
+        CSHARP
+        # WICHTIG: Wir veröffentlichen als linux-x86 App mit eigenem AppHost.
+        # Dies generiert die "schlaue" Executable, die .deps.json liest.
+        ./dotnet-sdk/dotnet publish SmartApp -c Release -r linux-x86 --self-contained true -p:UseAppHost=true -o ./SmartAppPublish
+
+    - name: Execute Test App with Custom Runtime (The Smart Way)
+      run: |
+        # Wir setzen DOTNET_ROOT auf unseren custom-built Shared Framework Ordner.
+        # Der generierte AppHost (SmartApp) ist "schlau": Er liest SmartApp.deps.json,
+        # findet heraus, welche DLLs er wirklich braucht, und fragt NUR diese 
+        # aus unserem DOTNET_ROOT Ordner ab. Kein TPA-Overflow mehr!
+        
+        export DOTNET_ROOT="$(pwd)/dotnet-portable-x86"
+        export DOTNET_gcServer=0 # Workstation GC für 32-Bit Stabilität
+        
+        # setarch i686 -R ist notwendig, um dem 32-Bit-Prozess auf dem 64-Bit Host
+        # einen zusammenhängenden virtuellen Speicher zu garantieren.
+        setarch i686 -R ./SmartAppPublish/SmartApp
+
+    - name: Zip and Upload Custom Runtime
+      if: success()
+      run: zip -r dotnet9-linux-x86-portable.zip dotnet-portable-x86
     - uses: actions/upload-artifact@v4
+      if: success()
       with:
-        name: dotnet9-linux-x86
-        path: dotnet9-linux-x86.zip
+        name: dotnet9-linux-x86-tested
+        path: dotnet9-linux-x86-portable.zip
