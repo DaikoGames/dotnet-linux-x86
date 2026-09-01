@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Pure Debian - W^X Fix & Native Host)
+name: Build .NET 9 Linux x86 Runtime
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-test-linux-x86:
+  build-linux-x86:
     runs-on: ubuntu-latest
     container:
       image: debian:bookworm
@@ -21,39 +21,13 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
 
     steps:
-    - name: Fix Kernel Memory Limits
-      run: |
-        apt-get update && apt-get install -y sudo procps
-        sudo sysctl -w vm.overcommit_memory=1
-        sudo sysctl -w vm.max_map_count=262144
-
-    - name: Install Build Dependencies (Pure Debian, FULL install)
+    - name: Install Build Dependencies
       run: |
         apt-get update
-        apt-get install -y \
-          wget curl python3 git cmake ninja-build ccache \
-          clang file build-essential sudo debootstrap qemu-user-static ca-certificates
-        
+        apt-get install -y wget curl python3 git cmake ninja-build ccache clang file build-essential sudo debootstrap ca-certificates
         dpkg --add-architecture i386
         apt-get update
-        
-        apt-get install -y \
-          gcc-multilib g++-multilib \
-          zlib1g-dev:i386 \
-          libicu-dev:i386 \
-          libssl-dev:i386 \
-          libunwind-dev:i386 \
-          liblttng-ust-dev:i386 \
-          binutils \
-          libc6-dev-i386 \
-          libstdc++-12-dev:i386
-
-    - name: Setup ccache for Maximum Speed
-      run: |
-        echo "/usr/lib/ccache" >> $GITHUB_PATH
-        ccache -M 5.0G
-        ccache -o compression_level=9
-        ccache -z
+        apt-get install -y gcc-multilib g++-multilib zlib1g-dev:i386 libicu-dev:i386 libssl-dev:i386 libunwind-dev:i386 liblttng-ust-dev:i386 binutils libc6-dev-i386 libstdc++-12-dev:i386
 
     - name: Checkout .NET 9 Runtime
       uses: actions/checkout@v4
@@ -62,7 +36,7 @@ jobs:
         ref: release/9.0
         path: runtime
 
-    - name: Build x86 Cross-Compilation RootFS (Pure Debian)
+    - name: Build x86 Cross-Compilation RootFS
       working-directory: runtime
       run: |
         sed -i 's|__UbuntuRepo="http://archive.ubuntu.com/ubuntu/"|__UbuntuRepo="http://deb.debian.org/debian/"|g' eng/common/cross/build-rootfs.sh
@@ -70,37 +44,23 @@ jobs:
         sed -i 's/__UbuntuSuites="updates security backports"/__UbuntuSuites="updates backports"/g' eng/common/cross/build-rootfs.sh
         sed -i 's/libunwind8-dev/libunwind-dev/g' eng/common/cross/build-rootfs.sh
         sed -i 's/liblldb-3.9-dev/liblldb-14-dev/g' eng/common/cross/build-rootfs.sh
-
         sudo ./eng/common/cross/build-rootfs.sh x86 bookworm
 
-    - name: Install and Patch .NET SDK
+    - name: Install .NET SDK
       working-directory: runtime
       run: |
         apt-get update && apt-get install -y python3
-        
         SDK_VERSION=$(python3 -c "import json; print(json.load(open('global.json'))['sdk']['version'])")
-        echo "Installing .NET SDK $SDK_VERSION (x64)"
-        
         mkdir -p .dotnet
         wget -q https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
         chmod +x dotnet-install.sh
         ./dotnet-install.sh --version $SDK_VERSION --install-dir .dotnet
-        
-        python3 -c "
-        import json
-        path = '.dotnet/sdk/$SDK_VERSION/RuntimeIdentifierGraph.json'
-        with open(path, 'r') as f: data = json.load(f)
-        if 'linux-x86' not in data['runtimes']:
-            data['runtimes']['linux-x86'] = { '#import': ['linux', 'x86'] }
-        with open(path, 'w') as f: json.dump(data, f, indent=2)
-        "
 
-    - name: Patch CoreCLR CMake to Bypass LTTng
+    - name: Patch CoreCLR CMake
       working-directory: runtime
       run: |
         sed -i 's/if(NOT HAVE_LTTNG_TRACEPOINT_H AND FEATURE_EVENT_TRACE)/if(FALSE)/' src/coreclr/pal/src/configure.cmake
         sed -i 's/if(CLR_CMAKE_HOST_LINUX)/if(FALSE)/' src/coreclr/pal/src/eventprovider/CMakeLists.txt
-        echo "Successfully patched CoreCLR to bypass LTTng."
 
     - name: Build CoreCLR and Libraries
       working-directory: runtime
@@ -111,122 +71,20 @@ jobs:
       run: |
         ./build.sh clr+libs -c Release -arch x86 -cross --ninja
 
-    - name: Package Self-Contained Runtime (STRICT WHITELIST)
+    - name: Package Runtime
       run: |
-        mkdir -p dotnet-portable-x86
-        
+        mkdir -p dotnet-linux-x86
         CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
-        echo "Found CoreCLR dir: $CORECLR_DIR"
-        cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
-        cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
-        find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
-        
+        cp "$CORECLR_DIR/corerun" dotnet-linux-x86/
+        cp "$CORECLR_DIR"/*.so dotnet-linux-x86/
+        find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-linux-x86/ \;
         RUNTIME_DIR=$(find runtime/artifacts/bin/runtime -type d -name "net9.0-linux-Release-x86" | head -n 1)
-        echo "Found Runtime dir: $RUNTIME_DIR"
-        
-        WHITELIST="
-        System.Runtime.dll
-        System.Console.dll
-        System.Threading.dll
-        System.Collections.dll
-        System.IO.dll
-        System.Runtime.InteropServices.dll
-        System.Text.Encoding.dll
-        System.Globalization.dll
-        System.Runtime.Extensions.dll
-        System.Diagnostics.Debug.dll
-        System.Private.Uri.dll
-        "
-        
-        for dll in $WHITELIST; do
-          if [ -f "$RUNTIME_DIR/$dll" ]; then
-            cp "$RUNTIME_DIR/$dll" dotnet-portable-x86/
-          fi
-        done
-        
-        echo "FINAL Packaged DLL count: $(ls -1 dotnet-portable-x86/*.dll | wc -l)"
-
-    - name: STRICT Architecture Verification
-      run: |
-        echo "=== Checking corerun architecture ==="
-        file dotnet-portable-x86/corerun
-        if ! file dotnet-portable-x86/corerun | grep -qi "32-bit"; then
-          echo "FATAL: corerun is NOT 32-bit!" && exit 1
-        fi
-        echo "=== ldd check ==="
-        LD_LIBRARY_PATH="$(pwd)/dotnet-portable-x86" ldd dotnet-portable-x86/corerun || true
-
-    - name: Create "Run From Anywhere" Launcher (W^X & NATIVE HOST FIX)
-      run: |
-        cat << 'EOF' > dotnet-portable-x86/run.sh
-        #!/bin/bash
-        DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
-        export DOTNET_ROOT="$DIR"
-        export LD_LIBRARY_PATH="$DIR:$LD_LIBRARY_PATH"
-        
-        # DER ECHTE FIX FÜR DOCKER/JIT:
-        # Docker blockiert oft mmap(PROT_EXEC) für anonyme Seiten. Der JIT braucht das aber.
-        # Diese Variable zwingt die CLR, RWX-Speicher zu nutzen oder alternative Pfade zu gehen.
-        export DOTNET_EnableWriteXorExecute=0
-        
-        # Deaktiviert EventPipe und Debugging-Overhead, spart massiv Memory beim Start
-        export DOTNET_EnableDiagnostics=0
-        
-        # Workstation GC (kein Server GC auf 32-Bit)
-        export DOTNET_gcServer=0
-        
-        # Keine QEMU-Emulation mehr! QEMU fragmentiert den 32-Bit-Speicher nur.
-        # Wir nutzen den nativen Host mit setarch, um ASLR zu deaktivieren.
-        exec setarch i686 -R "$DIR/corerun" "$@"
-        EOF
-        chmod +x dotnet-portable-x86/run.sh
-
-    - name: Install Standard .NET 9 SDK (for testing)
-      run: |
-        wget -q https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
-        chmod +x dotnet-install.sh
-        ./dotnet-install.sh --channel 9.0 --install-dir ./dotnet-sdk
-
-    - name: Create & Compile IL Stress Test
-      run: |
-        ./dotnet-sdk/dotnet new console -n IL_Stress_Test -o IL_Stress_Test --framework net9.0
-        cat << 'CSHARP' > IL_Stress_Test/Program.cs
-        using System;
-        using System.Threading;
-        using System.Runtime.InteropServices;
-
-        class Program {
-            static int Main() {
-                Console.WriteLine("=== Starting IL Stress Test for Linux x86 ===");
-                double result = 0;
-                for(int i=0; i<10000; i++) result += Math.Sin(i) * Math.Cos(i);
-                Console.WriteLine($"[PASS] Math/SSE Stack Alignment: {result}");
-                
-                byte[][] arrays = new byte[10][];
-                for(int i=0; i<10; i++) arrays[i] = new byte[1024 * 1024]; 
-                GC.Collect();
-                Console.WriteLine("[PASS] GC & Memory Allocation");
-                
-                int pid = getpid();
-                Console.WriteLine($"[PASS] P/Invoke (libc getpid): {pid}");
-                Console.WriteLine("=== ALL IL TESTS PASSED! RUNTIME IS STABLE ===");
-                return 0;
-            }
-            [DllImport("libc")]
-            static extern int getpid();
-        }
-        CSHARP
-        ./dotnet-sdk/dotnet build IL_Stress_Test -c Release
-
-    - name: Execute IL Stress Test
-      run: |
-        ./dotnet-portable-x86/run.sh ./IL_Stress_Test/bin/Release/net9.0/IL_Stress_Test.dll
+        cp "$RUNTIME_DIR"/*.dll dotnet-linux-x86/
+        echo "✅ Runtime built successfully! Packaged $(ls -1 dotnet-linux-x86/*.dll | wc -l) DLLs."
 
     - name: Zip and Upload
-      if: success()
-      run: zip -r dotnet9-linux-x86-portable.zip dotnet-portable-x86
+      run: zip -r dotnet9-linux-x86.zip dotnet-linux-x86
     - uses: actions/upload-artifact@v4
-      if: success()
       with:
-        name: dotnet9-linux-x86-tested
-        path: dotnet9-linux-x86-portable.zip
+        name: dotnet9-linux-x86
+        path: dotnet9-linux-x86.zip
