@@ -1,4 +1,4 @@
-name: Build & Test .NET 9 Linux x86 (Pure Debian - QEMU + Strict Whitelist)
+name: Build & Test .NET 9 Linux x86 (Pure Debian - Final QEMU + GC Limit)
 
 on:
   push:
@@ -30,7 +30,6 @@ jobs:
     - name: Install Build Dependencies (Pure Debian, FULL install)
       run: |
         apt-get update
-        # qemu-user ist der Schlüssel zur 32-Bit-Emulation
         apt-get install -y \
           wget curl python3 git cmake ninja-build ccache \
           clang file build-essential sudo debootstrap qemu-user qemu-user-static ca-certificates
@@ -112,19 +111,16 @@ jobs:
       run: |
         ./build.sh clr+libs -c Release -arch x86 -cross --ninja
 
-    - name: Package Self-Contained Runtime (STRICT WHITELIST + QEMU)
+    - name: Package Self-Contained Runtime (STRICT WHITELIST)
       run: |
         mkdir -p dotnet-portable-x86
         
-        # 1. Native CoreCLR Dateien
         CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
         echo "Found CoreCLR dir: $CORECLR_DIR"
         cp "$CORECLR_DIR/corerun" dotnet-portable-x86/
         cp "$CORECLR_DIR"/*.so dotnet-portable-x86/
         find "$CORECLR_DIR" -name "System.Private.CoreLib.dll" -exec cp {} dotnet-portable-x86/ \;
         
-        # 2. Managed DLLs: STRICT MINIMAL WHITELIST
-        # QEMU gibt uns den sauberen Speicher, aber wir dürfen den Startup-Overhead nicht sprengen.
         RUNTIME_DIR=$(find runtime/artifacts/bin/runtime -type d -name "net9.0-linux-Release-x86" | head -n 1)
         echo "Found Runtime dir: $RUNTIME_DIR"
         
@@ -160,7 +156,7 @@ jobs:
         echo "=== ldd check ==="
         LD_LIBRARY_PATH="$(pwd)/dotnet-portable-x86" ldd dotnet-portable-x86/corerun || true
 
-    - name: Create "Run From Anywhere" Launcher (QEMU EXECUTION)
+    - name: Create "Run From Anywhere" Launcher (PHYSICAL 32-BIT LIMITS)
       run: |
         cat << 'EOF' > dotnet-portable-x86/run.sh
         #!/bin/bash
@@ -168,12 +164,16 @@ jobs:
         export DOTNET_ROOT="$DIR"
         export LD_LIBRARY_PATH="$DIR:$LD_LIBRARY_PATH"
         
-        # Minimal GC settings for 32-bit stability
+        # PHYSIKALISCHE NOTWENDIGKEIT FÜR 32-BIT:
+        # Der .NET GC versucht standardmäßig, ~1.5 GB zusammenhängenden virtuellen Speicher zu reservieren.
+        # Auf 32-Bit ist dieser Block oft nicht verfügbar. Wir begrenzen ihn auf 256 MB (0x10000000).
+        # Innerhalb dieser 256 MB arbeitet der GC weiterhin dynamisch und prozentual wie gewünscht!
         export DOTNET_gcServer=0
+        export DOTNET_GCHeapHardLimit=0x10000000
         export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
+        export DOTNET_TieredCompilation=0
         
-        # DER GAMECHANGER: qemu-i386 stellt einen perfekten, nativen 32-Bit-Adressraum bereit.
-        # -L weist QEMU an, die Bibliotheken (.so) in unserem portable-Ordner zu suchen.
+        # QEMU stellt den perfekten 32-Bit-Adressraum bereit.
         exec qemu-i386 -L "$DIR" "$DIR/corerun" "$@"
         EOF
         chmod +x dotnet-portable-x86/run.sh
