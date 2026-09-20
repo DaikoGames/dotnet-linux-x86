@@ -102,7 +102,7 @@ jobs:
             --keyring /usr/share/keyrings/ubuntu-archive-keyring.gpg \
             --force-check-gpg \
             --arch i386 \
-            --mirror https://archive.ubuntu.com/ubuntu/ \
+            --mirror https://security.ubuntu.com/ubuntu/ \
             --rootfsdir "$ROOTFS_DIR" \
             --artool /usr/bin/ar \
             --suite noble \
