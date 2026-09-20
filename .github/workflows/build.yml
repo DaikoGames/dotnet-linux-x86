@@ -26,7 +26,7 @@ jobs:
           ref: release/10.0
           fetch-depth: 1
 
-      - name: Enable 32-bit packages
+      - name: Enable 32-bit architecture
         run: |
           set -eux
 
@@ -48,12 +48,26 @@ jobs:
             cmake \
             ninja-build \
             python3 \
+            python3-pip \
+            python3-venv \
             git \
             curl \
             pkg-config \
             zlib1g-dev:i386 \
             libssl-dev:i386 \
             libicu-dev:i386
+
+      - name: Install rootfs Python dependencies
+        run: |
+          set -eux
+
+          python3 -m pip install \
+            --user \
+            --break-system-packages \
+            aiohttp
+
+          python3 -c \
+            "import aiohttp; print('aiohttp:', aiohttp.__version__)"
 
       - name: Verify 32-bit compiler
         run: |
@@ -75,15 +89,17 @@ jobs:
 
           /tmp/test32
 
-          file /tmp/test32 | grep -q 'ELF 32-bit.*Intel 80386'
+          file /tmp/test32 | grep -q \
+            'ELF 32-bit.*Intel 80386'
 
       - name: Create Linux x86 rootfs
         run: |
           set -eux
 
+          rm -rf "$ROOTFS_DIR"
           mkdir -p "$ROOTFS_DIR"
 
-          sudo ./eng/common/cross/build-rootfs.sh \
+          sudo -E ./eng/common/cross/build-rootfs.sh \
             x86 \
             noble \
             --skipemulation \
@@ -91,23 +107,39 @@ jobs:
 
           sudo chown -R "$(id -u):$(id -g)" "$ROOTFS_DIR"
 
-      - name: Verify rootfs
+      - name: Verify Linux x86 rootfs
         run: |
           set -eux
 
+          test -d "$ROOTFS_DIR"
           test -d "$ROOTFS_DIR/usr"
           test -d "$ROOTFS_DIR/usr/include"
-          test -d "$ROOTFS_DIR/usr/lib"
 
-          echo "ROOTFS_DIR=$ROOTFS_DIR"
+          echo "=== Rootfs size ==="
+          du -sh "$ROOTFS_DIR"
 
-          find "$ROOTFS_DIR/usr/lib" \
-            -maxdepth 2 \
+          echo
+          echo "=== Rootfs libc ==="
+
+          find "$ROOTFS_DIR" \
             -type f \
-            \( -name 'libc.so*' -o -name 'libgcc_s.so*' \) \
-            | head -50
+            -name 'libc.so*' \
+            -print \
+            | head -20
 
-      - name: Restore runtime tools
+          echo
+          echo "=== Rootfs libc architecture ==="
+
+          if [ -f "$ROOTFS_DIR/lib/i386-linux-gnu/libc.so.6" ]; then
+            file "$ROOTFS_DIR/lib/i386-linux-gnu/libc.so.6"
+          elif [ -f "$ROOTFS_DIR/usr/lib/i386-linux-gnu/libc.so.6" ]; then
+            file "$ROOTFS_DIR/usr/lib/i386-linux-gnu/libc.so.6"
+          else
+            echo "ERROR: Could not locate 32-bit libc"
+            exit 1
+          fi
+
+      - name: Restore .NET build tools
         run: |
           set -eux
 
@@ -131,14 +163,16 @@ jobs:
             -component clr.runtime \
             -component clr.corelib \
             -component clr.jit \
-            2>&1 | tee build-log/coreclr-x86.log
+            2>&1 \
+            | tee build-log/coreclr-x86.log
 
       - name: Locate CoreCLR artifacts
         run: |
           set -eux
 
+          echo "=== CoreCLR artifacts ==="
+
           find artifacts/bin/coreclr \
-            -maxdepth 3 \
             -type f \
             \( \
               -name 'libcoreclr.so' \
@@ -148,27 +182,7 @@ jobs:
             \) \
             -print
 
-      - name: Verify CoreCLR architecture
-        run: |
-          set -eux
-
-          CORECLR_DIR="artifacts/bin/coreclr/linux.x86.Release"
-
-          test -d "$CORECLR_DIR"
-
-          echo "=== CoreCLR directory ==="
-          ls -lah "$CORECLR_DIR"
-
-          echo
-          echo "=== ELF files ==="
-
-          find "$CORECLR_DIR" \
-            -type f \
-            -exec file {} \; \
-            | grep -E 'ELF|80386' \
-            || true
-
-      - name: Verify libcoreclr.so
+      - name: Locate libcoreclr.so
         run: |
           set -eux
 
@@ -179,15 +193,23 @@ jobs:
               | head -1
           )"
 
-          test -n "$CORECLR"
+          if [ -z "$CORECLR" ]; then
+            echo "ERROR: libcoreclr.so was not produced."
+            exit 1
+          fi
 
-          echo "CoreCLR: $CORECLR"
+          echo "CoreCLR:"
+          echo "$CORECLR"
+
+          echo
+          echo "=== libcoreclr.so ==="
 
           file "$CORECLR"
 
-          file "$CORECLR" | grep -q 'ELF 32-bit.*Intel 80386'
+          file "$CORECLR" | grep -q \
+            'ELF 32-bit.*Intel 80386'
 
-      - name: Verify JIT
+      - name: Verify CoreCLR JIT
         run: |
           set -eux
 
@@ -198,13 +220,21 @@ jobs:
               | head -1
           )"
 
-          test -n "$JIT"
+          if [ -z "$JIT" ]; then
+            echo "ERROR: clrjit.so was not produced."
+            exit 1
+          fi
 
-          echo "JIT: $JIT"
+          echo "JIT:"
+          echo "$JIT"
+
+          echo
+          echo "=== clrjit.so ==="
 
           file "$JIT"
 
-          file "$JIT" | grep -q 'ELF 32-bit.*Intel 80386'
+          file "$JIT" | grep -q \
+            'ELF 32-bit.*Intel 80386'
 
       - name: Verify corerun
         run: |
@@ -217,17 +247,52 @@ jobs:
               | head -1
           )"
 
-          test -n "$CORERUN"
+          if [ -z "$CORERUN" ]; then
+            echo "ERROR: corerun was not produced."
+            exit 1
+          fi
 
-          echo "corerun: $CORERUN"
+          echo "corerun:"
+          echo "$CORERUN"
+
+          echo
+          echo "=== corerun ==="
 
           file "$CORERUN"
 
-          file "$CORERUN" | grep -q 'ELF 32-bit.*Intel 80386'
+          file "$CORERUN" | grep -q \
+            'ELF 32-bit.*Intel 80386'
 
           chmod +x "$CORERUN"
 
+          echo
+          echo "=== corerun help ==="
+
           "$CORERUN" --help || true
+
+      - name: Verify all native CoreCLR binaries
+        run: |
+          set -eux
+
+          echo "=== Native binaries ==="
+
+          find artifacts/bin/coreclr \
+            -type f \
+            -exec file {} \; \
+            | grep 'ELF 32-bit'
+
+      - name: Show CoreCLR directory
+        if: always()
+        run: |
+          set +e
+
+          echo "=== artifacts/bin/coreclr ==="
+
+          find artifacts/bin/coreclr \
+            -maxdepth 4 \
+            -type f \
+            -print \
+            | sort
 
       - name: Upload CoreCLR artifacts
         if: always()
@@ -235,6 +300,6 @@ jobs:
         with:
           name: dotnet-coreclr-linux-x86-${{ github.sha }}
           path: |
-            artifacts/bin/coreclr/linux.x86.Release
+            artifacts/bin/coreclr/
             build-log/coreclr-x86.log
           if-no-files-found: warn
