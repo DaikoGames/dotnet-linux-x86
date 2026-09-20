@@ -20,10 +20,6 @@ jobs:
 
     steps:
 
-      # ============================================================
-      # Source
-      # ============================================================
-
       - name: Checkout .NET Runtime
         uses: actions/checkout@v4
         with:
@@ -31,22 +27,11 @@ jobs:
           ref: release/10.0
           fetch-depth: 1
 
-
-      # ============================================================
-      # Enable 32-bit architecture
-      # ============================================================
-
       - name: Enable 32-bit architecture
         run: |
           set -eux
-
           sudo dpkg --add-architecture i386
           sudo apt-get update
-
-
-      # ============================================================
-      # Host build dependencies
-      # ============================================================
 
       - name: Install build dependencies
         run: |
@@ -72,11 +57,6 @@ jobs:
             libssl-dev:i386 \
             libicu-dev:i386
 
-
-      # ============================================================
-      # Python dependencies required by install-debs.py
-      # ============================================================
-
       - name: Install rootfs Python dependencies
         run: |
           set -eux
@@ -88,11 +68,6 @@ jobs:
 
           python3 -c \
             "import aiohttp; print('aiohttp:', aiohttp.__version__)"
-
-
-      # ============================================================
-      # Verify 32-bit compiler
-      # ============================================================
 
       - name: Verify 32-bit compiler
         run: |
@@ -111,16 +86,10 @@ jobs:
           gcc -m32 /tmp/test32.c -o /tmp/test32
 
           file /tmp/test32
-
           /tmp/test32
 
           file /tmp/test32 | grep -q \
             'ELF 32-bit.*Intel 80386'
-
-
-      # ============================================================
-      # Build Linux x86 rootfs
-      # ============================================================
 
       - name: Create Linux x86 rootfs
         run: |
@@ -153,11 +122,6 @@ jobs:
             libomp-dev
 
           sudo chown -R "$(id -u):$(id -g)" "$ROOTFS_DIR"
-
-
-      # ============================================================
-      # Verify rootfs
-      # ============================================================
 
       - name: Verify Linux x86 rootfs
         run: |
@@ -207,16 +171,10 @@ jobs:
           fi
 
           echo "libc: $LIBC"
-
           file "$LIBC"
 
           file "$LIBC" | grep -q \
             'ELF 32-bit.*Intel 80386'
-
-
-      # ============================================================
-      # Build CoreCLR
-      # ============================================================
 
       - name: Build CoreCLR Linux x86
         run: |
@@ -227,6 +185,82 @@ jobs:
 
           export ROOTFS_DIR="$ROOTFS_DIR"
 
+          export CC="/usr/bin/clang-18"
+          export CXX="/usr/bin/clang++-18"
+
+          export CFLAGS="--target=i386-linux-gnu --sysroot=$ROOTFS_DIR"
+          export CXXFLAGS="--target=i386-linux-gnu --sysroot=$ROOTFS_DIR"
+
+          export LDFLAGS="--target=i386-linux-gnu --sysroot=$ROOTFS_DIR -fuse-ld=lld"
+
+          echo "========================================"
+          echo "Cross compiler"
+          echo "========================================"
+
+          "$CC" --version
+
+          echo
+          echo "CRT startup files:"
+
+          "$CC" \
+            --target=i386-linux-gnu \
+            --sysroot="$ROOTFS_DIR" \
+            -print-file-name=crtbeginS.o
+
+          echo
+          echo "========================================"
+          echo "Checking 32-bit startup files"
+          echo "========================================"
+
+          find "$ROOTFS_DIR" \
+            \( \
+              -name 'Scrt1.o' \
+              -o -name 'crti.o' \
+              -o -name 'crtbeginS.o' \
+              -o -name 'crtendS.o' \
+              -o -name 'crtn.o' \
+            \) \
+            -print
+
+          echo
+          echo "========================================"
+          echo "Testing i386 Clang"
+          echo "========================================"
+
+          cat > /tmp/test-clang-x86.c <<'EOF'
+          #include <stdio.h>
+
+          int main(void)
+          {
+              printf("Hello from Linux i386!\n");
+              return 0;
+          }
+          EOF
+
+          "$CC" \
+            --target=i386-linux-gnu \
+            --sysroot="$ROOTFS_DIR" \
+            -fuse-ld=lld \
+            /tmp/test-clang-x86.c \
+            -o /tmp/test-clang-x86
+
+          file /tmp/test-clang-x86
+
+          file /tmp/test-clang-x86 | grep -q \
+            'ELF 32-bit.*Intel 80386'
+
+          echo
+          echo "========================================"
+          echo "Running i386 Clang test"
+          echo "========================================"
+
+          /tmp/test-clang-x86
+
+          echo
+          echo "========================================"
+          echo "Building CoreCLR"
+          echo "========================================"
+
           ./src/coreclr/build-runtime.sh \
             -arch x86 \
             -hostarch x64 \
@@ -236,13 +270,15 @@ jobs:
             -component clr.runtime \
             -component clr.corelib \
             -component clr.jit \
+            -cmakeargs "-DCMAKE_C_COMPILER_TARGET=i386-linux-gnu" \
+            -cmakeargs "-DCMAKE_CXX_COMPILER_TARGET=i386-linux-gnu" \
+            -cmakeargs "-DCMAKE_SYSROOT=$ROOTFS_DIR" \
+            -cmakeargs "-DCMAKE_C_COMPILER=$CC" \
+            -cmakeargs "-DCMAKE_CXX_COMPILER=$CXX" \
+            -cmakeargs "-DCMAKE_EXE_LINKER_FLAGS=--target=i386-linux-gnu -fuse-ld=lld" \
+            -cmakeargs "-DCMAKE_SHARED_LINKER_FLAGS=--target=i386-linux-gnu -fuse-ld=lld" \
             2>&1 \
             | tee build-log/coreclr-x86.log
-
-
-      # ============================================================
-      # Locate artifacts
-      # ============================================================
 
       - name: Locate CoreCLR artifacts
         run: |
@@ -262,11 +298,6 @@ jobs:
               -o -name 'System.Private.CoreLib.dll' \
             \) \
             -print
-
-
-      # ============================================================
-      # Verify libcoreclr.so
-      # ============================================================
 
       - name: Verify libcoreclr.so
         run: |
@@ -292,11 +323,6 @@ jobs:
           file "$CORECLR" | grep -q \
             'ELF 32-bit.*Intel 80386'
 
-
-      # ============================================================
-      # Verify JIT
-      # ============================================================
-
       - name: Verify CoreCLR JIT
         run: |
           set -eux
@@ -320,11 +346,6 @@ jobs:
 
           file "$JIT" | grep -q \
             'ELF 32-bit.*Intel 80386'
-
-
-      # ============================================================
-      # Verify corerun
-      # ============================================================
 
       - name: Verify corerun
         run: |
@@ -359,11 +380,6 @@ jobs:
 
           "$CORERUN" --help || true
 
-
-      # ============================================================
-      # Verify generated native binaries
-      # ============================================================
-
       - name: Verify native CoreCLR binaries
         run: |
           set -eux
@@ -377,11 +393,6 @@ jobs:
             -type f \
             -exec file {} \; \
             | grep 'ELF 32-bit'
-
-
-      # ============================================================
-      # Diagnostics
-      # ============================================================
 
       - name: Show CoreCLR output
         if: always()
@@ -398,11 +409,6 @@ jobs:
             -type f \
             -print \
             | sort
-
-
-      # ============================================================
-      # Upload artifacts
-      # ============================================================
 
       - name: Upload CoreCLR artifacts
         if: always()
