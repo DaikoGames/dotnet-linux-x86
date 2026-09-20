@@ -19,6 +19,11 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+
+      # ============================================================
+      # Source
+      # ============================================================
+
       - name: Checkout .NET Runtime
         uses: actions/checkout@v4
         with:
@@ -26,12 +31,18 @@ jobs:
           ref: release/10.0
           fetch-depth: 1
 
+
+      # ============================================================
+      # Host dependencies
+      # ============================================================
+
       - name: Enable 32-bit architecture
         run: |
           set -eux
 
           sudo dpkg --add-architecture i386
           sudo apt-get update
+
 
       - name: Install build dependencies
         run: |
@@ -57,6 +68,11 @@ jobs:
             libssl-dev:i386 \
             libicu-dev:i386
 
+
+      # ============================================================
+      # Python dependencies used by build-rootfs.sh
+      # ============================================================
+
       - name: Install rootfs Python dependencies
         run: |
           set -eux
@@ -68,6 +84,11 @@ jobs:
 
           python3 -c \
             "import aiohttp; print('aiohttp:', aiohttp.__version__)"
+
+
+      # ============================================================
+      # Verify native x86 compiler
+      # ============================================================
 
       - name: Verify 32-bit compiler
         run: |
@@ -92,6 +113,15 @@ jobs:
           file /tmp/test32 | grep -q \
             'ELF 32-bit.*Intel 80386'
 
+
+      # ============================================================
+      # Build x86 rootfs
+      #
+      # We deliberately do NOT use the runtime repository's default
+      # package list because it contains packages which are not
+      # available for i386 on Ubuntu Noble.
+      # ============================================================
+
       - name: Create Linux x86 rootfs
         run: |
           set -eux
@@ -99,13 +129,35 @@ jobs:
           rm -rf "$ROOTFS_DIR"
           mkdir -p "$ROOTFS_DIR"
 
-          sudo -E ./eng/common/cross/build-rootfs.sh \
-            x86 \
-            noble \
-            --skipemulation \
-            --rootfsdir "$ROOTFS_DIR"
+          python3 ./eng/common/cross/install-debs.py \
+            --keyring /usr/share/keyrings/ubuntu-archive-keyring.gpg \
+            --force-check-gpg \
+            --arch i386 \
+            --mirror https://archive.ubuntu.com/ubuntu/ \
+            --rootfsdir "$ROOTFS_DIR" \
+            --artool /usr/bin/ar \
+            --suite noble \
+            --suite noble-updates \
+            --suite noble-security \
+            --suite noble-backports \
+            build-essential \
+            symlinks \
+            libicu-dev \
+            libunwind8-dev \
+            libcurl4-openssl-dev \
+            libkrb5-dev \
+            libssl-dev \
+            zlib1g-dev \
+            libbrotli-dev \
+            libomp5 \
+            libomp-dev
 
           sudo chown -R "$(id -u):$(id -g)" "$ROOTFS_DIR"
+
+
+      # ============================================================
+      # Verify rootfs
+      # ============================================================
 
       - name: Verify Linux x86 rootfs
         run: |
@@ -115,35 +167,67 @@ jobs:
           test -d "$ROOTFS_DIR/usr"
           test -d "$ROOTFS_DIR/usr/include"
 
-          echo "=== Rootfs size ==="
+          echo "========================================"
+          echo "Linux x86 rootfs"
+          echo "========================================"
+
           du -sh "$ROOTFS_DIR"
 
           echo
-          echo "=== Rootfs libc ==="
+          echo "========================================"
+          echo "32-bit libraries"
+          echo "========================================"
 
           find "$ROOTFS_DIR" \
             -type f \
-            -name 'libc.so*' \
+            \( \
+              -name 'libc.so*' \
+              -o -name 'libgcc_s.so*' \
+              -o -name 'libstdc++.so*' \
+            \) \
             -print \
-            | head -20
+            | head -50
 
           echo
-          echo "=== Rootfs libc architecture ==="
+          echo "========================================"
+          echo "libc architecture"
+          echo "========================================"
 
-          if [ -f "$ROOTFS_DIR/lib/i386-linux-gnu/libc.so.6" ]; then
-            file "$ROOTFS_DIR/lib/i386-linux-gnu/libc.so.6"
-          elif [ -f "$ROOTFS_DIR/usr/lib/i386-linux-gnu/libc.so.6" ]; then
-            file "$ROOTFS_DIR/usr/lib/i386-linux-gnu/libc.so.6"
-          else
-            echo "ERROR: Could not locate 32-bit libc"
+          LIBC="$(
+            find "$ROOTFS_DIR" \
+              -type f \
+              -path '*i386-linux-gnu*' \
+              -name 'libc.so.6' \
+              | head -1
+          )"
+
+          if [ -z "$LIBC" ]; then
+            echo "ERROR: 32-bit libc was not found."
             exit 1
           fi
+
+          echo "libc: $LIBC"
+
+          file "$LIBC"
+
+          file "$LIBC" | grep -q \
+            'ELF 32-bit.*Intel 80386'
+
+
+      # ============================================================
+      # Restore .NET build tools
+      # ============================================================
 
       - name: Restore .NET build tools
         run: |
           set -eux
 
           ./restore.sh
+
+
+      # ============================================================
+      # Build CoreCLR
+      # ============================================================
 
       - name: Build CoreCLR Linux x86
         run: |
@@ -166,11 +250,19 @@ jobs:
             2>&1 \
             | tee build-log/coreclr-x86.log
 
+
+      # ============================================================
+      # Locate artifacts
+      # ============================================================
+
       - name: Locate CoreCLR artifacts
         run: |
           set -eux
 
-          echo "=== CoreCLR artifacts ==="
+          echo
+          echo "========================================"
+          echo "CoreCLR artifacts"
+          echo "========================================"
 
           find artifacts/bin/coreclr \
             -type f \
@@ -182,7 +274,12 @@ jobs:
             \) \
             -print
 
-      - name: Locate libcoreclr.so
+
+      # ============================================================
+      # Verify libcoreclr.so
+      # ============================================================
+
+      - name: Verify libcoreclr.so
         run: |
           set -eux
 
@@ -201,13 +298,15 @@ jobs:
           echo "CoreCLR:"
           echo "$CORECLR"
 
-          echo
-          echo "=== libcoreclr.so ==="
-
           file "$CORECLR"
 
           file "$CORECLR" | grep -q \
             'ELF 32-bit.*Intel 80386'
+
+
+      # ============================================================
+      # Verify JIT
+      # ============================================================
 
       - name: Verify CoreCLR JIT
         run: |
@@ -228,13 +327,15 @@ jobs:
           echo "JIT:"
           echo "$JIT"
 
-          echo
-          echo "=== clrjit.so ==="
-
           file "$JIT"
 
           file "$JIT" | grep -q \
             'ELF 32-bit.*Intel 80386'
+
+
+      # ============================================================
+      # Verify corerun
+      # ============================================================
 
       - name: Verify corerun
         run: |
@@ -255,9 +356,6 @@ jobs:
           echo "corerun:"
           echo "$CORERUN"
 
-          echo
-          echo "=== corerun ==="
-
           file "$CORERUN"
 
           file "$CORERUN" | grep -q \
@@ -266,33 +364,56 @@ jobs:
           chmod +x "$CORERUN"
 
           echo
-          echo "=== corerun help ==="
+          echo "========================================"
+          echo "corerun --help"
+          echo "========================================"
 
           "$CORERUN" --help || true
 
-      - name: Verify all native CoreCLR binaries
+
+      # ============================================================
+      # Verify every native ELF generated by CoreCLR
+      # ============================================================
+
+      - name: Verify native CoreCLR binaries
         run: |
           set -eux
 
-          echo "=== Native binaries ==="
+          echo
+          echo "========================================"
+          echo "32-bit ELF binaries"
+          echo "========================================"
 
           find artifacts/bin/coreclr \
             -type f \
             -exec file {} \; \
             | grep 'ELF 32-bit'
 
-      - name: Show CoreCLR directory
+
+      # ============================================================
+      # Diagnostics
+      # ============================================================
+
+      - name: Show CoreCLR output
         if: always()
         run: |
           set +e
 
-          echo "=== artifacts/bin/coreclr ==="
+          echo
+          echo "========================================"
+          echo "CoreCLR output tree"
+          echo "========================================"
 
           find artifacts/bin/coreclr \
-            -maxdepth 4 \
+            -maxdepth 5 \
             -type f \
             -print \
             | sort
+
+
+      # ============================================================
+      # Upload
+      # ============================================================
 
       - name: Upload CoreCLR artifacts
         if: always()
