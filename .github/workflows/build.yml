@@ -286,6 +286,7 @@ jobs:
             -cmakeargs "-DCMAKE_SYSROOT=$ROOTFS_DIR" \
             -cmakeargs "-DCMAKE_C_COMPILER=$CC" \
             -cmakeargs "-DCMAKE_CXX_COMPILER=$CXX" \
+            -cmakeargs "-DFEATURE_LTTNG=0" \
             2>&1 \
             | tee build-log/coreclr-x86.log
 
