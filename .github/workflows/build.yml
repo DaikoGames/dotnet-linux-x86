@@ -30,6 +30,7 @@ jobs:
       - name: Enable 32-bit architecture
         run: |
           set -eux
+
           sudo dpkg --add-architecture i386
           sudo apt-get update
 
@@ -171,6 +172,7 @@ jobs:
           fi
 
           echo "libc: $LIBC"
+
           file "$LIBC"
 
           file "$LIBC" | grep -q \
@@ -191,8 +193,6 @@ jobs:
           export CFLAGS="--target=i386-linux-gnu --sysroot=$ROOTFS_DIR"
           export CXXFLAGS="--target=i386-linux-gnu --sysroot=$ROOTFS_DIR"
 
-          export LDFLAGS="--target=i386-linux-gnu --sysroot=$ROOTFS_DIR -fuse-ld=lld"
-
           echo "========================================"
           echo "Cross compiler"
           echo "========================================"
@@ -200,7 +200,19 @@ jobs:
           "$CC" --version
 
           echo
-          echo "CRT startup files:"
+          echo "========================================"
+          echo "Compiler target"
+          echo "========================================"
+
+          "$CC" \
+            --target=i386-linux-gnu \
+            --sysroot="$ROOTFS_DIR" \
+            -dumpmachine
+
+          echo
+          echo "========================================"
+          echo "CRT startup files"
+          echo "========================================"
 
           "$CC" \
             --target=i386-linux-gnu \
@@ -240,7 +252,6 @@ jobs:
           "$CC" \
             --target=i386-linux-gnu \
             --sysroot="$ROOTFS_DIR" \
-            -fuse-ld=lld \
             /tmp/test-clang-x86.c \
             -o /tmp/test-clang-x86
 
@@ -275,8 +286,6 @@ jobs:
             -cmakeargs "-DCMAKE_SYSROOT=$ROOTFS_DIR" \
             -cmakeargs "-DCMAKE_C_COMPILER=$CC" \
             -cmakeargs "-DCMAKE_CXX_COMPILER=$CXX" \
-            -cmakeargs "-DCMAKE_EXE_LINKER_FLAGS=--target=i386-linux-gnu -fuse-ld=lld" \
-            -cmakeargs "-DCMAKE_SHARED_LINKER_FLAGS=--target=i386-linux-gnu -fuse-ld=lld" \
             2>&1 \
             | tee build-log/coreclr-x86.log
 
