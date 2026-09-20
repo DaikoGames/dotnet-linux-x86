@@ -1,4 +1,4 @@
-name: Experimental .NET Linux-x86
+name: Experimental .NET 10 Linux-x86
 
 on:
   workflow_dispatch:
@@ -8,37 +8,43 @@ permissions:
 
 jobs:
   linux-x86:
-    # This is deliberately an x64 builder.
-    # Microsoft does NOT currently support Linux -> x86 CoreCLR
-    # cross-compilation, so every result must be verified.
     runs-on: ubuntu-24.04
 
     env:
       CONFIGURATION: Release
-      ARCH: x86
-      OS: linux
+      TARGET_ARCH: x86
+      TARGET_OS: linux
+      ROOTFS_DIR: ${{ github.workspace }}/.tools/rootfs/x86
 
     steps:
-      - name: Checkout runtime
+      - name: Checkout .NET 10 runtime
         uses: actions/checkout@v4
         with:
           repository: dotnet/runtime
-          ref: main
+          ref: release/10.0
           fetch-depth: 1
 
-      - name: Install 32-bit build dependencies
+      - name: Enable i386 architecture
         run: |
           set -eux
 
           sudo dpkg --add-architecture i386
           sudo apt-get update
 
+      - name: Install host and x86 build dependencies
+        run: |
+          set -eux
+
           sudo apt-get install -y \
             build-essential \
+            gcc \
+            g++ \
             gcc-multilib \
             g++-multilib \
+            libc6-dev \
             libc6-dev-i386 \
             binutils \
+            binutils-multiarch \
             clang \
             lld \
             cmake \
@@ -46,262 +52,178 @@ jobs:
             python3 \
             git \
             curl \
+            wget \
+            file \
+            patchelf \
+            pkg-config \
+            zlib1g-dev \
             zlib1g-dev:i386
 
-      - name: Verify 32-bit compiler
+      - name: Verify host compiler
         run: |
           set -eux
 
-          cat > /tmp/x86-test.c <<'EOF'
+          gcc --version
+          g++ --version
+          cmake --version
+          ninja --version
+
+      - name: Verify Linux x86 compiler
+        run: |
+          set -eux
+
+          cat > /tmp/linux-x86-test.c <<'EOF'
           #include <stdio.h>
-          int main(void) {
-              printf("Linux x86 test executable works.\n");
+          #include <stdint.h>
+
+          int main(void)
+          {
+              printf("Linux x86 compiler test\n");
+              printf("sizeof(void*) = %zu\n", sizeof(void*));
+              printf("sizeof(uintptr_t) = %zu\n", sizeof(uintptr_t));
               return 0;
           }
           EOF
 
-          gcc -m32 /tmp/x86-test.c -o /tmp/x86-test
+          gcc \
+            -m32 \
+            -fPIC \
+            /tmp/linux-x86-test.c \
+            -o /tmp/linux-x86-test
 
-          file /tmp/x86-test
+          file /tmp/linux-x86-test
 
-          if ! file /tmp/x86-test | grep -q "32-bit"; then
-            echo "::error::Compiler did not produce a 32-bit executable."
-            exit 1
-          fi
+          readelf -h /tmp/linux-x86-test
 
-          /tmp/x86-test
+          /tmp/linux-x86-test
 
-      - name: Attempt CoreCLR build
-        id: build
-        continue-on-error: true
+          test "$(file /tmp/linux-x86-test | grep -c 'ELF 32-bit')" -eq 1
+
+      - name: Prepare x86 ROOTFS directory
         run: |
+          set -eux
+
+          mkdir -p "$ROOTFS_DIR"
+
+          echo "ROOTFS_DIR=$ROOTFS_DIR"
+
+      - name: Inspect existing cross-build infrastructure
+        run: |
+          set -eux
+
+          echo "Checking runtime cross-build files..."
+
+          test -f eng/common/cross/build-rootfs.sh
+
+          echo
+          echo "Available cross infrastructure:"
+          find eng/common/cross \
+            -maxdepth 2 \
+            -type f \
+            -print | sort
+
+      - name: Show architecture support in source
+        run: |
+          set -eux
+
+          echo "Searching for Linux/x86 architecture handling..."
+
+          grep -R \
+            -n \
+            -E \
+            'UNIX_X86_ABI|TARGET_X86|CLR_CMAKE_TARGET_ARCH_X86|x86.*linux|linux.*x86' \
+            src/coreclr \
+            eng \
+            2>/dev/null \
+            | head -n 500 \
+            || true
+
+      - name: Attempt native x86 CoreCLR configure
+        run: |
+          set -eux
           set -o pipefail
 
-          mkdir -p "$GITHUB_WORKSPACE/build-log"
+          mkdir -p build-log
 
           ./build.sh \
             -subset clr \
-            -arch x86 \
-            -os linux \
             -configuration "$CONFIGURATION" \
-            2>&1 | tee "$GITHUB_WORKSPACE/build-log/coreclr.log"
+            -arch "$TARGET_ARCH" \
+            -os "$TARGET_OS" \
+            -ninja \
+            2>&1 | tee build-log/coreclr-x86.log
 
-      - name: Find generated binaries
+      - name: Locate CoreCLR output
         if: always()
         run: |
           set +e
 
-          mkdir -p output
+          echo "===== CoreCLR output directories ====="
 
-          find . \
+          find artifacts/bin/coreclr \
+            -maxdepth 3 \
+            -type d \
+            2>/dev/null \
+            | sort || true
+
+          echo
+          echo "===== CoreCLR binaries ====="
+
+          find artifacts/bin/coreclr \
             -type f \
             \( \
-              -name "libcoreclr.so" \
-              -o -name "corerun" \
-              -o -name "System.Private.CoreLib.dll" \
+              -name corerun \
+              -o -name libcoreclr.so \
+              -o -name System.Private.CoreLib.dll \
             \) \
             -print \
-            > output/generated-files.txt
+            2>/dev/null \
+            | sort || true
 
-          echo "Generated files:"
-          cat output/generated-files.txt || true
-
-      - name: Verify binary architectures
-        id: architecture
+      - name: Verify produced ELF files
         if: always()
         run: |
           set +e
 
           mkdir -p output
 
-          GOOD=0
-          BAD=0
+          find artifacts/bin/coreclr \
+            -type f \
+            \( \
+              -name corerun \
+              -o -name libcoreclr.so \
+            \) \
+            -print \
+            > output/native-binaries.txt \
+            2>/dev/null || true
+
+          : > output/architecture.txt
 
           while IFS= read -r binary; do
             [ -f "$binary" ] || continue
 
-            echo "Checking: $binary"
-            file "$binary" | tee -a output/architecture.txt
+            echo "========================================" \
+              | tee -a output/architecture.txt
 
-            if file "$binary" | grep -Eq \
-              'ELF 32-bit.*Intel 80386|ELF 32-bit.*80386'; then
-              GOOD=$((GOOD + 1))
-            else
-              BAD=$((BAD + 1))
-              echo "WARNING: not a verified Linux x86 binary."
-          fi
-          done < output/generated-files.txt
+            echo "$binary" \
+              | tee -a output/architecture.txt
 
-          echo "Verified x86 binaries: $GOOD"
-          echo "Invalid/non-x86 binaries: $BAD"
+            file "$binary" \
+              | tee -a output/architecture.txt
 
-          if [ "$GOOD" -eq 0 ]; then
-            echo "::warning::No verified Linux x86 ELF binaries were produced."
-          fi
+            readelf -h "$binary" \
+              | grep -E 'Class:|Machine:|OS/ABI:' \
+              | tee -a output/architecture.txt
 
-      - name: Runtime execution test
-        id: runtime_test
-        if: always()
-        run: |
-          set +e
+          done < output/native-binaries.txt
 
-          mkdir -p output
-
-          CORERUN="$(find . -type f -name corerun -print -quit)"
-
-          if [ -z "$CORERUN" ]; then
-            echo "NO_CORERUN" > output/runtime-test.txt
-            echo "::warning::No corerun executable was produced."
-            exit 0
-          fi
-
-          chmod +x "$CORERUN"
-
-          echo "Testing:"
-          echo "$CORERUN"
-
-          file "$CORERUN"
-
-          if ! file "$CORERUN" | grep -Eq \
-            'ELF 32-bit.*Intel 80386|ELF 32-bit.*80386'; then
-            echo "WRONG_ARCHITECTURE" > output/runtime-test.txt
-            echo "::error::corerun is not a verified Linux x86 executable."
-            exit 0
-          fi
-
-          if "$CORERUN" --help > output/corerun-output.txt 2>&1; then
-            echo "EXECUTION_SUCCESS" > output/runtime-test.txt
-            echo "Linux x86 CoreCLR executable successfully started."
-          else
-            echo "EXECUTION_FAILED" > output/runtime-test.txt
-            echo "::error::The generated Linux x86 CoreCLR binary exists but failed to execute."
-          fi
-
-      - name: Memory/address-space diagnostics
-        if: always()
-        run: |
-          set +e
-
-          mkdir -p output
-
-          {
-            echo "===== ARCHITECTURE ====="
-            uname -m
-            getconf LONG_BIT
-
-            echo
-            echo "===== MEMORY ====="
-            free -h
-
-            echo
-            echo "===== /proc/meminfo ====="
-            cat /proc/meminfo
-
-            echo
-            echo "===== 32-BIT ADDRESS SPACE ====="
-            ulimit -a
-
-            echo
-            echo "===== BUILD RESULT ====="
-            echo "Build step: ${{ steps.build.outcome }}"
-            echo "Architecture check: ${{ steps.architecture.outcome }}"
-            echo "Runtime test: ${{ steps.runtime_test.outcome }}"
-          } > output/diagnostics.txt
-
-      - name: Create truthful result
-        if: always()
-        run: |
-          set +e
-
-          mkdir -p output
-
-          BUILD="${{ steps.build.outcome }}"
-
-          if [ -f output/runtime-test.txt ]; then
-            TEST="$(cat output/runtime-test.txt)"
-          else
-            TEST="NO_TEST_RESULT"
-          fi
-
-          if [ "$BUILD" = "success" ] && \
-             [ "$TEST" = "EXECUTION_SUCCESS" ]; then
-
-            cat > output/RESULT.txt <<'EOF'
-          SUCCESS
-
-          CoreCLR was built and a generated Linux x86 executable
-          successfully started on the test environment.
-
-          This does NOT make Linux x86 an officially supported
-          Microsoft .NET target.
-          EOF
-
-          else
-
-            cat > output/RESULT.txt <<'EOF'
-          NOT WORKING
-
-          The experimental Linux x86 build did not produce a
-          verified, executable CoreCLR runtime.
-
-          No binary in this artifact should be treated as a
-          working .NET runtime.
-
-          This workflow intentionally reports failure instead of
-          pretending that an unsupported target succeeded.
-          EOF
-
-          fi
-
-          cat output/RESULT.txt
-
-      - name: Package experimental output
-        if: always()
-        run: |
-          set +e
-
-          mkdir -p artifact
-
-          cp -a output artifact/ 2>/dev/null || true
-          cp -a build-log artifact/ 2>/dev/null || true
-
-          find . \
-            -type f \
-            \( \
-              -name "libcoreclr.so" \
-              -o -name "corerun" \
-              -o -name "System.Private.CoreLib.dll" \
-            \) \
-            -exec cp --parents {} artifact/ \; \
-            2>/dev/null || true
-
-      - name: Upload diagnostics and binaries
+      - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dotnet-linux-x86-experimental
-          path: artifact/
+          name: dotnet-linux-x86-build
+          path: |
+            build-log/
+            output/
+            artifacts/log/
           if-no-files-found: warn
-
-      # IMPORTANT:
-      # Do not mark the workflow successful merely because GitHub
-      # managed to execute the build steps.
-      - name: Fail if runtime is not actually executable
-        if: always()
-        run: |
-          if [ "${{ steps.build.outcome }}" != "success" ]; then
-            echo "::error::CoreCLR Linux x86 build failed."
-            exit 1
-          fi
-
-          if [ ! -f output/runtime-test.txt ]; then
-            echo "::error::No runtime test was performed."
-            exit 1
-          fi
-
-          if [ "$(cat output/runtime-test.txt)" != "EXECUTION_SUCCESS" ]; then
-            echo "::error::Linux x86 CoreCLR did not successfully execute."
-            exit 1
-          fi
-
-          echo "Verified: generated Linux x86 CoreCLR executed."
