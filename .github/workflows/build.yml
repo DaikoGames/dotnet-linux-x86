@@ -1,54 +1,48 @@
-name: Experimental .NET 10 Linux-x86
+name: Experimental .NET Linux-x86
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
 
-permissions:
-  contents: read
+env:
+  CONFIGURATION: Release
+  TARGET_ARCH: x86
+  TARGET_OS: linux
+  HOST_ARCH: x64
+  ROOTFS_DIR: ${{ github.workspace }}/.tools/rootfs/x86
 
 jobs:
-  linux-x86:
+  build-coreclr-x86:
     runs-on: ubuntu-24.04
 
-    env:
-      CONFIGURATION: Release
-      TARGET_ARCH: x86
-      TARGET_OS: linux
-      ROOTFS_DIR: ${{ github.workspace }}/.tools/rootfs/x86
-
-      # Linux-x86 is intentionally being revived locally.
-      # Microsoft does not provide a linux-x86 AppHost NuGet package.
-      UseLocalAppHostPack: true
-
     steps:
-      - name: Checkout .NET 10 runtime
+      - name: Checkout .NET Runtime
         uses: actions/checkout@v4
         with:
           repository: dotnet/runtime
           ref: release/10.0
           fetch-depth: 1
 
-      - name: Enable i386 architecture
+      - name: Enable 32-bit packages
         run: |
           set -eux
 
           sudo dpkg --add-architecture i386
           sudo apt-get update
 
-      - name: Install host and x86 build dependencies
+      - name: Install build dependencies
         run: |
           set -eux
 
           sudo apt-get install -y \
             build-essential \
-            gcc \
-            g++ \
             gcc-multilib \
             g++-multilib \
-            libc6-dev \
             libc6-dev-i386 \
             binutils \
-            binutils-multiarch \
             clang \
             lld \
             cmake \
@@ -56,140 +50,191 @@ jobs:
             python3 \
             git \
             curl \
-            wget \
-            file \
-            patchelf \
             pkg-config \
-            zlib1g-dev \
-            zlib1g-dev:i386
+            zlib1g-dev:i386 \
+            libssl-dev:i386 \
+            libicu-dev:i386
 
-      - name: Verify x86 compiler
+      - name: Verify 32-bit compiler
         run: |
           set -eux
 
-          cat > /tmp/linux-x86-test.c <<'EOF'
+          cat > /tmp/test32.c <<'EOF'
           #include <stdio.h>
-          #include <stdint.h>
 
           int main(void)
           {
-              printf("Linux x86 compiler test\n");
-              printf("pointer size: %zu bytes\n", sizeof(void*));
-              printf("uintptr_t size: %zu bytes\n", sizeof(uintptr_t));
+              printf("32-bit compiler works\n");
               return 0;
           }
           EOF
 
-          gcc \
-            -m32 \
-            -fPIC \
-            /tmp/linux-x86-test.c \
-            -o /tmp/linux-x86-test
+          gcc -m32 /tmp/test32.c -o /tmp/test32
 
-          file /tmp/linux-x86-test
+          file /tmp/test32
 
-          readelf -h /tmp/linux-x86-test
+          /tmp/test32
 
-          /tmp/linux-x86-test
+          file /tmp/test32 | grep -q 'ELF 32-bit.*Intel 80386'
 
-          file /tmp/linux-x86-test | grep -q 'ELF 32-bit'
-
-      - name: Inspect AppHost configuration
+      - name: Create Linux x86 rootfs
         run: |
           set -eux
 
-          echo "Searching for AppHost handling..."
+          mkdir -p "$ROOTFS_DIR"
 
-          grep -R \
-            -n \
-            -E \
-            'UseLocalAppHostPack|KnownAppHostPack|AppHostSourcePath|NETSDK1084' \
-            eng \
-            src \
-            Build.proj \
-            Directory.Build.* \
-            2>/dev/null \
-            | head -n 500 \
-            || true
+          sudo ./eng/common/cross/build-rootfs.sh \
+            x86 \
+            noble \
+            --skipemulation \
+            --rootfsdir "$ROOTFS_DIR"
 
-      - name: Attempt CoreCLR build
+          sudo chown -R "$(id -u):$(id -g)" "$ROOTFS_DIR"
+
+      - name: Verify rootfs
+        run: |
+          set -eux
+
+          test -d "$ROOTFS_DIR/usr"
+          test -d "$ROOTFS_DIR/usr/include"
+          test -d "$ROOTFS_DIR/usr/lib"
+
+          echo "ROOTFS_DIR=$ROOTFS_DIR"
+
+          find "$ROOTFS_DIR/usr/lib" \
+            -maxdepth 2 \
+            -type f \
+            \( -name 'libc.so*' -o -name 'libgcc_s.so*' \) \
+            | head -50
+
+      - name: Restore runtime tools
+        run: |
+          set -eux
+
+          ./restore.sh
+
+      - name: Build CoreCLR Linux x86
         run: |
           set -eux
           set -o pipefail
 
           mkdir -p build-log
 
-          ./build.sh \
-            -subset clr \
-            -configuration "$CONFIGURATION" \
-            -arch "$TARGET_ARCH" \
-            -os "$TARGET_OS" \
-            -ninja \
-            /p:UseLocalAppHostPack=true \
+          export ROOTFS_DIR="$ROOTFS_DIR"
+
+          ./src/coreclr/build-runtime.sh \
+            -arch x86 \
+            -hostarch x64 \
+            -os linux \
+            -release \
+            -cross \
+            -component clr.runtime \
+            -component clr.corelib \
+            -component clr.jit \
             2>&1 | tee build-log/coreclr-x86.log
 
-      - name: Locate CoreCLR output
-        if: always()
+      - name: Locate CoreCLR artifacts
         run: |
-          set +e
-
-          mkdir -p output
-
-          echo "===== CoreCLR directories ====="
+          set -eux
 
           find artifacts/bin/coreclr \
             -maxdepth 3 \
-            -type d \
-            2>/dev/null \
-            | sort || true
-
-          echo
-          echo "===== CoreCLR binaries ====="
-
-          find artifacts/bin/coreclr \
             -type f \
             \( \
-              -name corerun \
-              -o -name libcoreclr.so \
-              -o -name System.Private.CoreLib.dll \
+              -name 'libcoreclr.so' \
+              -o -name 'clrjit.so' \
+              -o -name 'corerun' \
+              -o -name 'System.Private.CoreLib.dll' \
             \) \
-            -print \
-            2>/dev/null \
-            | sort \
-            | tee output/generated-files.txt
+            -print
 
-      - name: Verify ELF architecture
-        if: always()
+      - name: Verify CoreCLR architecture
         run: |
-          set +e
+          set -eux
 
-          : > output/architecture.txt
+          CORECLR_DIR="artifacts/bin/coreclr/linux.x86.Release"
 
-          while IFS= read -r binary; do
-            [ -f "$binary" ] || continue
+          test -d "$CORECLR_DIR"
 
-            echo "========================================" \
-              | tee -a output/architecture.txt
+          echo "=== CoreCLR directory ==="
+          ls -lah "$CORECLR_DIR"
 
-            echo "FILE: $binary" \
-              | tee -a output/architecture.txt
+          echo
+          echo "=== ELF files ==="
 
-            file "$binary" \
-              | tee -a output/architecture.txt
+          find "$CORECLR_DIR" \
+            -type f \
+            -exec file {} \; \
+            | grep -E 'ELF|80386' \
+            || true
 
-            readelf -h "$binary" \
-              | grep -E 'Class:|Machine:|OS/ABI:' \
-              | tee -a output/architecture.txt
+      - name: Verify libcoreclr.so
+        run: |
+          set -eux
 
-          done < output/generated-files.txt
+          CORECLR="$(
+            find artifacts/bin/coreclr \
+              -type f \
+              -name 'libcoreclr.so' \
+              | head -1
+          )"
 
-      - name: Upload diagnostics
+          test -n "$CORECLR"
+
+          echo "CoreCLR: $CORECLR"
+
+          file "$CORECLR"
+
+          file "$CORECLR" | grep -q 'ELF 32-bit.*Intel 80386'
+
+      - name: Verify JIT
+        run: |
+          set -eux
+
+          JIT="$(
+            find artifacts/bin/coreclr \
+              -type f \
+              -name 'clrjit.so' \
+              | head -1
+          )"
+
+          test -n "$JIT"
+
+          echo "JIT: $JIT"
+
+          file "$JIT"
+
+          file "$JIT" | grep -q 'ELF 32-bit.*Intel 80386'
+
+      - name: Verify corerun
+        run: |
+          set -eux
+
+          CORERUN="$(
+            find artifacts/bin/coreclr \
+              -type f \
+              -name 'corerun' \
+              | head -1
+          )"
+
+          test -n "$CORERUN"
+
+          echo "corerun: $CORERUN"
+
+          file "$CORERUN"
+
+          file "$CORERUN" | grep -q 'ELF 32-bit.*Intel 80386'
+
+          chmod +x "$CORERUN"
+
+          "$CORERUN" --help || true
+
+      - name: Upload CoreCLR artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dotnet-linux-x86-build
+          name: dotnet-coreclr-linux-x86-${{ github.sha }}
           path: |
-            build-log/
-            output/
-            artifacts/log/
+            artifacts/bin/coreclr/linux.x86.Release
+            build-log/coreclr-x86.log
           if-no-files-found: warn
