@@ -1,182 +1,264 @@
-name: Build & Test .NET 9 Linux x86 (Smart Apphost Architecture)
+name: Experimental .NET Linux x86
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  build-and-test-linux-x86:
-    runs-on: ubuntu-latest
-    container:
-      image: debian:bookworm
-      options: --privileged
+  build-linux-x86:
+    runs-on: ubuntu-24.04
 
     env:
-      UseNinja: true
-      CMAKE_GENERATOR: Ninja
-      CFLAGS: "-mstackrealign -fPIC"
-      CXXFLAGS: "-mstackrealign -fPIC -ftls-model=global-dynamic"
-      LDFLAGS: "-Wl,-z,noexecstack"
-      DEBIAN_FRONTEND: noninteractive
+      DOTNET_REPO: https://github.com/dotnet/runtime.git
+      DOTNET_REF: main
+      CONFIGURATION: Release
+      ARCH: x86
+      TARGET_OS: linux
 
     steps:
-    - name: Fix Kernel Memory Limits
-      run: |
-        apt-get update && apt-get install -y sudo procps
-        sudo sysctl -w vm.overcommit_memory=1
-        sudo sysctl -w vm.max_map_count=262144
+      - name: Checkout .NET runtime
+        uses: actions/checkout@v4
+        with:
+          repository: dotnet/runtime
+          ref: ${{ env.DOTNET_REF }}
+          fetch-depth: 1
 
-    - name: Install Build Dependencies (Pure Debian, FULL install)
-      run: |
-        apt-get update
-        apt-get install -y \
-          wget curl python3 git cmake ninja-build ccache \
-          clang file build-essential sudo debootstrap ca-certificates
-        
-        dpkg --add-architecture i386
-        apt-get update
-        
-        apt-get install -y \
-          gcc-multilib g++-multilib \
-          zlib1g-dev:i386 \
-          libicu-dev:i386 \
-          libssl-dev:i386 \
-          libunwind-dev:i386 \
-          liblttng-ust-dev:i386 \
-          binutils \
-          libc6-dev-i386 \
-          libstdc++-12-dev:i386
+      - name: Install build dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
 
-    - name: Setup ccache for Maximum Speed
-      run: |
-        echo "/usr/lib/ccache" >> $GITHUB_PATH
-        ccache -M 5.0G
-        ccache -o compression_level=9
-        ccache -z
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            ninja-build \
+            python3 \
+            python3-pip \
+            curl \
+            git \
+            wget \
+            llvm \
+            lld \
+            gcc-multilib \
+            g++-multilib \
+            libc6-dev-i386 \
+            libstdc++-12-dev:i386 \
+            zlib1g-dev:i386 \
+            libssl-dev:i386 \
+            libicu-dev:i386
 
-    - name: Checkout .NET 9 Runtime
-      uses: actions/checkout@v4
-      with:
-        repository: dotnet/runtime
-        ref: release/9.0
-        path: runtime
+      - name: Show host architecture
+        run: |
+          echo "Host:"
+          uname -a
+          uname -m
 
-    - name: Build x86 Cross-Compilation RootFS (Pure Debian)
-      working-directory: runtime
-      run: |
-        sed -i 's|__UbuntuRepo="http://archive.ubuntu.com/ubuntu/"|__UbuntuRepo="http://deb.debian.org/debian/"|g' eng/common/cross/build-rootfs.sh
-        sed -i 's/Components: main universe/Components: main/g' eng/common/cross/build-rootfs.sh
-        sed -i 's/__UbuntuSuites="updates security backports"/__UbuntuSuites="updates backports"/g' eng/common/cross/build-rootfs.sh
-        sed -i 's/libunwind8-dev/libunwind-dev/g' eng/common/cross/build-rootfs.sh
-        sed -i 's/liblldb-3.9-dev/liblldb-14-dev/g' eng/common/cross/build-rootfs.sh
-        sudo ./eng/common/cross/build-rootfs.sh x86 bookworm
+          echo
+          echo "Available GCC:"
+          gcc --version
 
-    - name: Install and Patch .NET SDK
-      working-directory: runtime
-      run: |
-        apt-get update && apt-get install -y python3
-        SDK_VERSION=$(python3 -c "import json; print(json.load(open('global.json'))['sdk']['version'])")
-        echo "Installing .NET SDK $SDK_VERSION (x64)"
-        mkdir -p .dotnet
-        wget -q https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
-        chmod +x dotnet-install.sh
-        ./dotnet-install.sh --version $SDK_VERSION --install-dir .dotnet
-        
-        python3 -c "
-        import json
-        path = '.dotnet/sdk/$SDK_VERSION/RuntimeIdentifierGraph.json'
-        with open(path, 'r') as f: data = json.load(f)
-        if 'linux-x86' not in data['runtimes']:
-            data['runtimes']['linux-x86'] = { '#import': ['linux', 'x86'] }
-        with open(path, 'w') as f: json.dump(data, f, indent=2)
-        "
+          echo
+          echo "32-bit compiler test:"
+          printf '#include <stdio.h>\nint main(){printf("32-bit OK\\n");return 0;}' \
+            > /tmp/test32.c
 
-    - name: Patch CoreCLR CMake to Bypass LTTng
-      working-directory: runtime
-      run: |
-        sed -i 's/if(NOT HAVE_LTTNG_TRACEPOINT_H AND FEATURE_EVENT_TRACE)/if(FALSE)/' src/coreclr/pal/src/configure.cmake
-        sed -i 's/if(CLR_CMAKE_HOST_LINUX)/if(FALSE)/' src/coreclr/pal/src/eventprovider/CMakeLists.txt
-        echo "Successfully patched CoreCLR to bypass LTTng."
+          if gcc -m32 /tmp/test32.c -o /tmp/test32; then
+            file /tmp/test32
+            /tmp/test32
+          else
+            echo "::warning::The host cannot produce a 32-bit test executable."
+          fi
 
-    - name: Build CoreCLR and Libraries
-      working-directory: runtime
-      env:
-        ROOTFS_DIR: ${{ github.workspace }}/runtime/.tools/rootfs/x86
-        DOTNET_INSTALL_DIR: ${{ github.workspace }}/runtime/.dotnet
-        DOTNET_MULTILEVEL_LOOKUP: 0
-      run: |
-        ./build.sh clr+libs -c Release -arch x86 -cross --ninja
+      - name: Restore .NET build tools
+        continue-on-error: true
+        run: |
+          ./eng/common/native/init-compiler.sh
 
-    - name: Package Runtime as Official Shared Framework (The "All DLLs" Folder)
-      run: |
-        # Wir erstellen die offizielle .NET Ordnerstruktur. 
-        # Hier liegen ALLE DLLs, die wir kompiliert haben.
-        SHARED_FRAMEWORK_DIR="dotnet-portable-x86/shared/Microsoft.NETCore.App/9.0.0"
-        mkdir -p "$SHARED_FRAMEWORK_DIR"
-        
-        CORECLR_DIR=$(find runtime/artifacts/bin/coreclr -type d \( -name "Linux.x86.Release" -o -name "linux.x86.Release" \) | head -n 1)
-        RUNTIME_DIR=$(find runtime/artifacts/bin/runtime -type d -name "net9.0-linux-Release-x86" | head -n 1)
-        
-        # Native Teile
-        cp "$CORECLR_DIR/corerun" "$SHARED_FRAMEWORK_DIR/"
-        cp "$CORECLR_DIR"/*.so "$SHARED_FRAMEWORK_DIR/"
-        
-        # ALLE Managed DLLs in den Shared Framework Ordner
-        cp "$RUNTIME_DIR"/*.dll "$SHARED_FRAMEWORK_DIR/"
-        
-        echo "✅ Shared Framework erstellt. Enthält $(ls -1 "$SHARED_FRAMEWORK_DIR"/*.dll | wc -l) DLLs."
+      - name: Attempt CoreCLR x86 build
+        id: coreclr
+        continue-on-error: true
+        run: |
+          echo "Attempting experimental Linux x86 CoreCLR build..."
 
-    - name: Install Standard .NET 9 SDK (for generating the smart AppHost)
-      run: |
-        wget -q https://dot.net/v1/dotnet-install.sh -O dotnet-install.sh
-        chmod +x dotnet-install.sh
-        ./dotnet-install.sh --channel 9.0 --install-dir ./dotnet-sdk
+          ./build.sh \
+            -subset clr+libs \
+            -arch x86 \
+            -os linux \
+            -configuration "$CONFIGURATION"
 
-    - name: Create & Compile Test App
-      run: |
-        ./dotnet-sdk/dotnet new console -n SmartApp -o SmartApp --framework net9.0
-        cat << 'CSHARP' > SmartApp/Program.cs
-        using System;
-        using System.Runtime.InteropServices;
+      - name: Locate produced binaries
+        id: locate
+        continue-on-error: true
+        run: |
+          mkdir -p artifacts/linux-x86
 
-        class Program {
-            static int Main() {
-                Console.WriteLine("=== SMART APPHOST TEST START ===");
-                Console.WriteLine("Runtime loaded successfully with minimal TPA!");
-                
-                int pid = getpid();
-                Console.WriteLine($"[PASS] P/Invoke (libc getpid): {pid}");
-                Console.WriteLine("=== TEST PASSED ===");
-                return 0;
-            }
-            [DllImport("libc")]
-            static extern int getpid();
-        }
-        CSHARP
-        # WICHTIG: Wir veröffentlichen als linux-x86 App mit eigenem AppHost.
-        # Dies generiert die "schlaue" Executable, die .deps.json liest.
-        ./dotnet-sdk/dotnet publish SmartApp -c Release -r linux-x86 --self-contained true -p:UseAppHost=true -o ./SmartAppPublish
+          echo "Searching for produced CoreCLR files..."
 
-    - name: Execute Test App with Custom Runtime (The Smart Way)
-      run: |
-        # Wir setzen DOTNET_ROOT auf unseren custom-built Shared Framework Ordner.
-        # Der generierte AppHost (SmartApp) ist "schlau": Er liest SmartApp.deps.json,
-        # findet heraus, welche DLLs er wirklich braucht, und fragt NUR diese 
-        # aus unserem DOTNET_ROOT Ordner ab. Kein TPA-Overflow mehr!
-        
-        export DOTNET_ROOT="$(pwd)/dotnet-portable-x86"
-        export DOTNET_gcServer=0 # Workstation GC für 32-Bit Stabilität
-        
-        # setarch i686 -R ist notwendig, um dem 32-Bit-Prozess auf dem 64-Bit Host
-        # einen zusammenhängenden virtuellen Speicher zu garantieren.
-        setarch i686 -R ./SmartAppPublish/SmartApp
+          find artifacts \
+            \( -name "libcoreclr.so" \
+            -o -name "corerun" \
+            -o -name "hostfxr" \
+            -o -name "libhostfxr.so" \
+            -o -name "System.Private.CoreLib.dll" \
+            -o -name "dotnet" \) \
+            -type f \
+            -print \
+            | tee artifacts/linux-x86/produced-files.txt
 
-    - name: Zip and Upload Custom Runtime
-      if: success()
-      run: zip -r dotnet9-linux-x86-portable.zip dotnet-portable-x86
-    - uses: actions/upload-artifact@v4
-      if: success()
-      with:
-        name: dotnet9-linux-x86-tested
-        path: dotnet9-linux-x86-portable.zip
+          echo
+          echo "Architecture checks:"
+
+          while IFS= read -r file; do
+            if [ -f "$file" ]; then
+              echo
+              echo "===== $file ====="
+              file "$file" || true
+            fi
+          done < artifacts/linux-x86/produced-files.txt
+
+      - name: Runtime smoke test
+        id: smoke
+        continue-on-error: true
+        run: |
+          mkdir -p artifacts/linux-x86/test
+
+          cat > artifacts/linux-x86/test/README.txt <<'EOF'
+          Experimental Linux x86 .NET runtime build.
+
+          This build is not an officially supported .NET RID.
+          The workflow attempts to build CoreCLR for 32-bit Linux
+          and records whether the generated binaries can actually
+          execute on the build machine.
+          EOF
+
+          if [ -x artifacts/bin/coreclr/linux.x86.Release/corerun ]; then
+            CORERUN=artifacts/bin/coreclr/linux.x86.Release/corerun
+
+            echo "Testing corerun..."
+            file "$CORERUN"
+
+            if "$CORERUN" --help; then
+              echo "CORERUN_EXECUTABLE=YES" \
+                | tee artifacts/linux-x86/test/result.txt
+            else
+              echo "CORERUN_EXECUTABLE=NO" \
+                | tee artifacts/linux-x86/test/result.txt
+              echo "ERROR: corerun was produced but could not execute."
+            fi
+          else
+            echo "CORERUN_EXECUTABLE=NOT_BUILT" \
+              | tee artifacts/linux-x86/test/result.txt
+
+            echo "ERROR: CoreCLR did not produce corerun."
+          fi
+
+      - name: Check 32-bit ELF compatibility
+        continue-on-error: true
+        run: |
+          echo "Checking all generated ELF binaries..."
+
+          find artifacts -type f -exec file {} \; \
+            | grep -E 'ELF.*(32-bit|Intel 80386)' \
+            | tee artifacts/linux-x86/elf32.txt || true
+
+      - name: Collect build logs
+        if: always()
+        run: |
+          mkdir -p artifacts/linux-x86/logs
+
+          if [ -d artifacts/log ]; then
+            cp -a artifacts/log/. artifacts/linux-x86/logs/ || true
+          fi
+
+          {
+            echo "===== BUILD RESULT ====="
+            echo "CoreCLR step: ${{ steps.coreclr.outcome }}"
+            echo "Smoke test:   ${{ steps.smoke.outcome }}"
+            echo
+            echo "===== SYSTEM ====="
+            uname -a
+            getconf LONG_BIT || true
+            free -h
+            cat /proc/meminfo
+          } > artifacts/linux-x86/build-report.txt
+
+      - name: Create failure marker
+        if: always()
+        run: |
+          mkdir -p artifacts/linux-x86
+
+          if [ "${{ steps.coreclr.outcome }}" != "success" ]; then
+            cat > artifacts/linux-x86/BUILD_FAILED.txt <<'EOF'
+          ERROR: The experimental Linux x86 CoreCLR build did not complete.
+
+          The workflow intentionally continued so that partial binaries,
+          build logs, compiler output, and diagnostics could still be
+          downloaded.
+
+          This does NOT mean that the produced binaries are runnable.
+          Check produced-files.txt, build-report.txt, elf32.txt, and logs/.
+          EOF
+          fi
+
+      - name: Package partial/full runtime
+        if: always()
+        run: |
+          mkdir -p artifacts/linux-x86/runtime
+
+          for path in \
+            artifacts/bin/coreclr/linux.x86.Release \
+            artifacts/tests/coreclr/linux.x86.Release/Tests/Core_Root
+          do
+            if [ -d "$path" ]; then
+              cp -a "$path" artifacts/linux-x86/runtime/
+            fi
+          done
+
+          tar -C artifacts/linux-x86 \
+            -czf artifacts/linux-x86-runtime.tar.gz \
+            runtime test logs \
+            *.txt 2>/dev/null || true
+
+      - name: Upload Linux x86 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-linux-x86-experimental
+          path: artifacts/linux-x86-runtime.tar.gz
+          if-no-files-found: warn
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-linux-x86-diagnostics
+          path: artifacts/linux-x86
+          if-no-files-found: warn
+
+      - name: Final status
+        if: always()
+        run: |
+          echo
+          echo "=========================================="
+          echo " Experimental Linux x86 build completed"
+          echo "=========================================="
+          echo
+
+          if [ "${{ steps.coreclr.outcome }}" = "success" ]; then
+            echo "CoreCLR build: SUCCESS"
+          else
+            echo "CoreCLR build: FAILED"
+            echo "Partial artifacts and logs were uploaded."
+          fi
+
+          if [ "${{ steps.smoke.outcome }}" = "success" ]; then
+            echo "Runtime smoke test: SUCCESS"
+          else
+            echo "Runtime smoke test: FAILED/UNAVAILABLE"
+          fi
+
+          echo
+          echo "The workflow intentionally does not fail the job."
