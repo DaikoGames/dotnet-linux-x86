@@ -16,6 +16,10 @@ jobs:
       TARGET_OS: linux
       ROOTFS_DIR: ${{ github.workspace }}/.tools/rootfs/x86
 
+      # Linux-x86 is intentionally being revived locally.
+      # Microsoft does not provide a linux-x86 AppHost NuGet package.
+      UseLocalAppHostPack: true
+
     steps:
       - name: Checkout .NET 10 runtime
         uses: actions/checkout@v4
@@ -59,16 +63,7 @@ jobs:
             zlib1g-dev \
             zlib1g-dev:i386
 
-      - name: Verify host compiler
-        run: |
-          set -eux
-
-          gcc --version
-          g++ --version
-          cmake --version
-          ninja --version
-
-      - name: Verify Linux x86 compiler
+      - name: Verify x86 compiler
         run: |
           set -eux
 
@@ -79,8 +74,8 @@ jobs:
           int main(void)
           {
               printf("Linux x86 compiler test\n");
-              printf("sizeof(void*) = %zu\n", sizeof(void*));
-              printf("sizeof(uintptr_t) = %zu\n", sizeof(uintptr_t));
+              printf("pointer size: %zu bytes\n", sizeof(void*));
+              printf("uintptr_t size: %zu bytes\n", sizeof(uintptr_t));
               return 0;
           }
           EOF
@@ -97,48 +92,27 @@ jobs:
 
           /tmp/linux-x86-test
 
-          test "$(file /tmp/linux-x86-test | grep -c 'ELF 32-bit')" -eq 1
+          file /tmp/linux-x86-test | grep -q 'ELF 32-bit'
 
-      - name: Prepare x86 ROOTFS directory
+      - name: Inspect AppHost configuration
         run: |
           set -eux
 
-          mkdir -p "$ROOTFS_DIR"
-
-          echo "ROOTFS_DIR=$ROOTFS_DIR"
-
-      - name: Inspect existing cross-build infrastructure
-        run: |
-          set -eux
-
-          echo "Checking runtime cross-build files..."
-
-          test -f eng/common/cross/build-rootfs.sh
-
-          echo
-          echo "Available cross infrastructure:"
-          find eng/common/cross \
-            -maxdepth 2 \
-            -type f \
-            -print | sort
-
-      - name: Show architecture support in source
-        run: |
-          set -eux
-
-          echo "Searching for Linux/x86 architecture handling..."
+          echo "Searching for AppHost handling..."
 
           grep -R \
             -n \
             -E \
-            'UNIX_X86_ABI|TARGET_X86|CLR_CMAKE_TARGET_ARCH_X86|x86.*linux|linux.*x86' \
-            src/coreclr \
+            'UseLocalAppHostPack|KnownAppHostPack|AppHostSourcePath|NETSDK1084' \
             eng \
+            src \
+            Build.proj \
+            Directory.Build.* \
             2>/dev/null \
             | head -n 500 \
             || true
 
-      - name: Attempt native x86 CoreCLR configure
+      - name: Attempt CoreCLR build
         run: |
           set -eux
           set -o pipefail
@@ -151,6 +125,7 @@ jobs:
             -arch "$TARGET_ARCH" \
             -os "$TARGET_OS" \
             -ninja \
+            /p:UseLocalAppHostPack=true \
             2>&1 | tee build-log/coreclr-x86.log
 
       - name: Locate CoreCLR output
@@ -158,7 +133,9 @@ jobs:
         run: |
           set +e
 
-          echo "===== CoreCLR output directories ====="
+          mkdir -p output
+
+          echo "===== CoreCLR directories ====="
 
           find artifacts/bin/coreclr \
             -maxdepth 3 \
@@ -178,24 +155,13 @@ jobs:
             \) \
             -print \
             2>/dev/null \
-            | sort || true
+            | sort \
+            | tee output/generated-files.txt
 
-      - name: Verify produced ELF files
+      - name: Verify ELF architecture
         if: always()
         run: |
           set +e
-
-          mkdir -p output
-
-          find artifacts/bin/coreclr \
-            -type f \
-            \( \
-              -name corerun \
-              -o -name libcoreclr.so \
-            \) \
-            -print \
-            > output/native-binaries.txt \
-            2>/dev/null || true
 
           : > output/architecture.txt
 
@@ -205,7 +171,7 @@ jobs:
             echo "========================================" \
               | tee -a output/architecture.txt
 
-            echo "$binary" \
+            echo "FILE: $binary" \
               | tee -a output/architecture.txt
 
             file "$binary" \
@@ -215,9 +181,9 @@ jobs:
               | grep -E 'Class:|Machine:|OS/ABI:' \
               | tee -a output/architecture.txt
 
-          done < output/native-binaries.txt
+          done < output/generated-files.txt
 
-      - name: Upload build diagnostics
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
